@@ -105,3 +105,19 @@ def test_annotate_rendering() -> None:
     res_hole = FrameResult(mask_hole, Command(0, 1.0, 1.0, False, 0.0, 0.0, 0.0), "TEST", 0.0, 0.0, 0.0, 0, [])
     ann3 = annotate(frame, res_hole, cfg=cfg)
     assert ann3.shape == (h, w, 3)
+
+def test_approach_rate_drops_speed() -> None:
+    d = smoke_config()['inference']['decision']
+    mask = np.zeros((100, 200), np.uint8); mask[50:, 60:140] = 1
+    free = compute_command(mask, [], trust=1.0, terrain=0, cfg=d)
+    
+    # Static near detection
+    near_static = [Detection(80, 60, 120, 80, 2, 'car', 0.9, approach_rate=1.0)]
+    cmd_static = compute_command(mask, near_static, trust=1.0, terrain=0, cfg=d)
+    
+    # Approaching near detection
+    near_app = [Detection(80, 60, 120, 80, 2, 'car', 0.9, approach_rate=1.1)]
+    cmd_app = compute_command(mask, near_app, trust=1.0, terrain=0, cfg=d)
+    
+    assert cmd_static.speed < free.speed
+    assert cmd_app.speed < cmd_static.speed

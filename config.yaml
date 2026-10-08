@@ -128,11 +128,11 @@ consistency:
     dt: 1.0
 
 fusion:
-  gain: 8.0
+  gain: 12.0
   w_certainty: 0.5
   w_geometric: 0.25
   w_temporal: 0.25
-  bias: -0.5
+  bias: -0.75
   terrain_penalty: [0.0, 0.1, 0.3, 0.5]
   hidden: 16
   fallback_threshold: 0.5
@@ -143,11 +143,12 @@ inference:
   checkpoint: ./outputs/checkpoints/student_best.pt
   frame_skip: 1
   queue_size: 8
+  input_size: [288, 512]
+  roi_polygon: [[0.0, 1.0], [0.2, 0.6], [0.8, 0.6], [1.0, 1.0]]
   speed_mps_input: 1.0
   display: false
   video_fourcc: mp4v
   use_terrain: false
-  hood_frac: 0.18
 
   overlay:
     bottom_frac: 0.90
@@ -160,6 +161,7 @@ inference:
 
   detector:
     backend: yolov8n
+    every_n: 3
     weights: yolov8n.pt
     conf: 0.30
     class_ids: [0, 1, 2, 3, 5, 7, 16, 17, 18, 19]

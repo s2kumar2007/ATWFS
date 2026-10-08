@@ -58,3 +58,33 @@ def test_training_stub_handles_missing_and_dummy_csv() -> None:
             w.writerow([*rng.random(3), int(rng.integers(0, 4)), float(rng.random() > 0.5)])
     out = train_fusion(cfg, str(p), epochs=5, out_path=str(resolve_path("./outputs/smoke/fusion_net.pt")))
     assert out is not None and resolve_path(out).exists()
+
+
+def test_alpha_sweep_properties() -> None:
+    cfg = smoke_config()["fusion"]
+    f = ATWFS(cfg)
+    fallback_reached = False
+    
+    # Check U monotonicity (lower U is better, so alpha should decrease as U increases)
+    for u in np.linspace(0, 1, 10):
+        a1 = f.alpha(u, 0.8, 0.8, 0)
+        a2 = f.alpha(u + 0.1, 0.8, 0.8, 0)
+        assert a2 <= a1 + 1e-4
+        if a2 < cfg["fallback_threshold"]: fallback_reached = True
+        
+    # Check G monotonicity
+    for g in np.linspace(0, 1, 10):
+        a1 = f.alpha(0.2, g, 0.8, 0)
+        a2 = f.alpha(0.2, g + 0.1, 0.8, 0)
+        assert a2 >= a1 - 1e-4
+        if a1 < cfg["fallback_threshold"]: fallback_reached = True
+
+    # Check T monotonicity
+    for t in np.linspace(0, 1, 10):
+        a1 = f.alpha(0.2, 0.8, t, 0)
+        a2 = f.alpha(0.2, 0.8, t + 0.1, 0)
+        assert a2 >= a1 - 1e-4
+        if a1 < cfg["fallback_threshold"]: fallback_reached = True
+        
+    assert fallback_reached
+    assert f.alpha(0.0, 1.0, 1.0, 0) > 0.9

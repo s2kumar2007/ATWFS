@@ -171,11 +171,11 @@ class MultiTaskLoss(nn.Module):
         l_terr = terrain_ce(out["terrain_logits"], batch["terrain"], c["terrain_ignore_index"])
         losses = torch.stack([l_seg, l_evid, l_terr])
         
-        clamped_log_vars = torch.clamp(self.log_vars, -4.0, 4.0)
+        clamped_log_vars = torch.clamp(self.log_vars, -2.0, 2.0)
         valid_terrain = (batch["terrain"] != c["terrain_ignore_index"]).any()
         valid_mask = torch.tensor([True, True, valid_terrain.item()], device=self.log_vars.device)
         
-        total = (torch.exp(-clamped_log_vars[valid_mask]) * losses[valid_mask] + clamped_log_vars[valid_mask]).sum()
+        total = (torch.exp(-clamped_log_vars[valid_mask]) * losses[valid_mask] + clamped_log_vars[valid_mask] + 2.0).sum()
         
         info = {"loss": float(total.detach()), "seg": float(l_seg.detach()), "ce": float(l_ce.detach()),
                 "dice": float(l_dice.detach()), "boundary": float(l_bnd.detach()), "aux": float(l_aux.detach()),
