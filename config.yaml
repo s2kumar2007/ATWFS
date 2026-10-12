@@ -144,7 +144,16 @@ inference:
   frame_skip: 1
   queue_size: 8
   input_size: [288, 512]
-  roi_polygon: [[0.0, 1.0], [0.2, 0.6], [0.8, 0.6], [1.0, 1.0]]
+  hood_polygon: [[0.0, 1.0], [0.1, 0.75], [0.9, 0.75], [1.0, 1.0]]
+  colors:
+    drivable: [30, 144, 255]
+    hood: [40, 40, 40]
+    vehicle_default: [0, 255, 255]
+    vehicle_approach: [255, 165, 0]
+    vehicle_obstacle: [255, 0, 0]
+    person: [255, 0, 255]
+    animal: [128, 0, 128]
+    tiny: [128, 128, 128]
   speed_mps_input: 1.0
   display: false
   video_fourcc: mp4v
@@ -162,8 +171,14 @@ inference:
   detector:
     backend: yolov8n
     every_n: 3
-    weights: yolov8n.pt
-    conf: 0.30
+    weights: yolov8s.pt
+    iou: 0.5
+    agnostic_nms: true
+    conf_thresholds:
+      person: 0.25
+      vehicle: 0.25
+      animal: 0.30
+    conf: 0.25
     class_ids: [0, 1, 2, 3, 5, 7, 16, 17, 18, 19]
 
   decision:
