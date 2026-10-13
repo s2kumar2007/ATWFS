@@ -122,25 +122,29 @@ class HorizonEstimator:
         h, w = frame_bgr.shape[:2]
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         
-        # Focus on lower 75% of the frame
+        # Focus on lower 75% of the frame at half resolution for speed
         roi_y1 = int(h * 0.25)
         gray_roi = gray[roi_y1:, :]
-        
-        edges = cv2.Canny(gray_roi, 50, 150)
-        if mask is not None:
-            m_roi = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)[roi_y1:, :]
-            # Dilate mask slightly to capture edges along road boundary
-            dilated = cv2.dilate(m_roi, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)))
-            edges = cv2.bitwise_and(edges, edges, mask=dilated)
+        half_w = max(1, w // 2)
+        half_roi_h = max(1, (h - roi_y1) // 2)
+        gray_half = cv2.resize(gray_roi, (half_w, half_roi_h), interpolation=cv2.INTER_AREA)
 
-        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=40, minLineLength=int(h * 0.1), maxLineGap=20)
+        edges = cv2.Canny(gray_half, 50, 150)
+        if mask is not None:
+            m_half = cv2.resize(mask, (half_w, max(1, h // 2)), interpolation=cv2.INTER_NEAREST)[(roi_y1 // 2):, :]
+            dilated = cv2.dilate(m_half, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+            if dilated.shape == edges.shape:
+                edges = cv2.bitwise_and(edges, edges, mask=dilated)
+
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=30, minLineLength=int(half_roi_h * 0.15), maxLineGap=15)
         if lines is None or len(lines) < 2:
             return self.smoothed_vp_y
 
         left_lines = []
         right_lines = []
         for line in lines:
-            x1, y1, x2, y2 = [float(v) for v in np.asarray(line).reshape(-1)[:4]]
+            pts = [float(v) * 2.0 for v in np.asarray(line).reshape(-1)[:4]]
+            x1, y1, x2, y2 = pts
             dx = x2 - x1
             dy = y2 - y1
             if abs(dx) < 1e-4:
@@ -296,48 +300,91 @@ class InversePerspectiveMapping:
         return cv2.warpPerspective(mask, H_img2bev, (self.bev_w_px, self.bev_h_px), flags=cv2.INTER_NEAREST)
 
     def extract_road_metrics(self, bev_mask: np.ndarray, distance_m: float = 6.0) -> Tuple[Optional[float], Optional[float]]:
-        """Extract physical road width (m) and lateral offset (m) from BEV mask at distance_m ahead."""
-        # Convert longitudinal distance into BEV row index
-        # y_bev = 0 is y_max, y_bev = bev_h_px is y_min
+        """Extract physical road width (m) and ego-lane lateral offset (m) from BEV mask at distance_m ahead."""
         y_frac = (distance_m - self.bev_min_dist_m) / max(1e-4, self.bev_height_m)
         if not (0.0 <= y_frac <= 1.0):
             return None, None
-            
+
         row_idx = int(round((1.0 - y_frac) * (self.bev_h_px - 1)))
-        # Sample band of 5 rows around row_idx for stability
         r1 = max(0, row_idx - 2)
         r2 = min(self.bev_h_px, row_idx + 3)
         band = bev_mask[r1:r2]
-        
-        # Check active drivable columns
+
         col_active = (band > 0).any(axis=0)
         nz_indices = np.where(col_active)[0]
         if len(nz_indices) < 3:
             return None, None
-            
-        width_px = nz_indices[-1] - nz_indices[0] + 1
-        width_m = float(width_px * self.bev_resolution)
-        
-        # Lateral offset from vehicle center line (center is bev_w_px / 2.0)
-        center_px = float(np.mean(nz_indices))
-        offset_px = center_px - (self.bev_w_px / 2.0)
+
+        # Find contiguous runs of drivable columns
+        diffs = np.diff(nz_indices)
+        split_points = np.where(diffs > 1)[0] + 1
+        runs = np.split(nz_indices, split_points)
+
+        ego_center_px = self.bev_w_px / 2.0
+        # Choose contiguous run containing the vehicle centre line or nearest to it
+        best_run = None
+        min_dist = float("inf")
+        for r in runs:
+            if len(r) < 2:
+                continue
+            r_start, r_end = r[0], r[-1]
+            if r_start <= ego_center_px <= r_end:
+                best_run = r
+                break
+            d = min(abs(r_start - ego_center_px), abs(r_end - ego_center_px))
+            if d < min_dist:
+                min_dist = d
+                best_run = r
+
+        if best_run is None or len(best_run) < 2:
+            if distance_m < 9.0:
+                return self.extract_road_metrics(bev_mask, distance_m=9.5)
+            return None, None
+
+        r_start, r_end = float(best_run[0]), float(best_run[-1])
+        run_width_px = r_end - r_start + 1.0
+        run_width_m = float(run_width_px * self.bev_resolution)
+
+        # If the centre at distance_m is masked by the ego hood dome, sample slightly further ahead (9.5m)
+        if distance_m < 9.0 and run_width_m < 1.5 and not (r_start <= ego_center_px <= r_end):
+            w_far, off_far = self.extract_road_metrics(bev_mask, distance_m=9.5)
+            if w_far is not None and w_far >= 1.5:
+                return w_far, off_far
+
+        run_center_px = (r_start + r_end) / 2.0
+
+        # If the run is wider than 4.0 m, use a window of +/-1.8 m around the point nearest the vehicle centre line
+        if run_width_m > 4.0:
+            window_half_px = 1.8 / self.bev_resolution
+            # Point in run nearest ego centre line, with +/-1.8 m buffer inside run boundaries
+            min_allowed = r_start + window_half_px
+            max_allowed = r_end - window_half_px
+            if min_allowed < max_allowed:
+                target_px = float(np.clip(ego_center_px, min_allowed, max_allowed))
+            else:
+                target_px = run_center_px
+        else:
+            target_px = run_center_px
+
+        offset_px = target_px - ego_center_px
         offset_m = float(offset_px * self.bev_resolution)
-        
-        return width_m, offset_m
+        return run_width_m, offset_m
 
     def process_frame(
         self,
         frame_bgr: np.ndarray,
         mask: np.ndarray,
         dt: float = 0.04,
-        imu_sample: Optional[Dict[str, float]] = None
+        imu_sample: Optional[Dict[str, float]] = None,
+        frame_idx: int = 0,
+        horizon_every_n: int = 5,
     ) -> IPMResult:
         """Run self-calibrating IPM on the current frame."""
         h, w = frame_bgr.shape[:2]
         pitch_rad = math.radians(self.nominal_pitch_deg)
         roll_rad = math.radians(self.nominal_roll_deg)
         method = "nominal"
-        
+
         # 1. Try IMU input if available
         if imu_sample is not None:
             pitch_rad, roll_rad = self.filter.update(
@@ -347,22 +394,27 @@ class InversePerspectiveMapping:
             )
             method = "imu_fused"
         else:
-            # 2. Try image horizon estimation
-            vp_y = self.horizon_est.estimate_horizon_y(frame_bgr, mask)
+            # 2. Try image horizon estimation (every horizon_every_n frames or on frame 0)
+            if horizon_every_n <= 1 or frame_idx % horizon_every_n == 0 or self.horizon_est.smoothed_vp_y is None:
+                vp_y = self.horizon_est.estimate_horizon_y(frame_bgr, mask)
+            else:
+                vp_y = self.horizon_est.smoothed_vp_y
+
             if vp_y is not None:
                 K = self.compute_intrinsics(w, h)
                 fy = K[1, 1]
                 cy = K[1, 2]
                 pitch_rad = math.atan2(vp_y - cy, fy)
                 method = "horizon_only"
-                
+
         self.current_pitch_deg = math.degrees(pitch_rad)
         self.current_roll_deg = math.degrees(roll_rad)
-        
+
         try:
             H_img2bev, _ = self.compute_homography(pitch_rad, roll_rad, w, h)
             bev_mask = self.warp_mask_to_bev(mask, H_img2bev)
-            width_m, offset_m = self.extract_road_metrics(bev_mask, distance_m=6.0)
+            lookahead_m = float(getattr(self, "bev_lookahead_m", 6.0))
+            width_m, offset_m = self.extract_road_metrics(bev_mask, distance_m=lookahead_m)
             valid = (width_m is not None and width_m > 1.0)
             return IPMResult(
                 bev_mask=bev_mask,

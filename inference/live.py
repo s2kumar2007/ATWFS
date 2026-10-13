@@ -1,14 +1,16 @@
 import os
 import argparse
-import logging
-import queue
-import threading
-import time
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
 import collections
 import csv
+from dataclasses import dataclass
+import logging
+from pathlib import Path
+import queue
+import shutil
+import subprocess
+import threading
+import time
+from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
@@ -25,7 +27,7 @@ from models.unet_mobilenet import build_model, evidential_uncertainty
 from training.train import load_model_from_checkpoint
 from utils.config import load_config, resolve_path
 from utils.logging_utils import setup_logging
-from utils.seed import set_global_seed, get_device
+from utils.seed import get_device, set_global_seed
 
 logger = logging.getLogger(__name__)
 
@@ -42,97 +44,120 @@ class FrameResult:
     detections: List[Detection]
     ipm: Optional[IPMResult] = None
     mode: str = "day"
+    mask_model: Optional[np.ndarray] = None
 
 
 class LivePipeline:
-    def __init__(self, cfg: Dict[str, Any], model: torch.nn.Module, device: torch.device,
-                 detector: ObstacleDetector, fusion: Optional[ATWFS] = None) -> None:
+    def __init__(
+        self,
+        cfg: Dict[str, Any],
+        model: torch.nn.Module,
+        device: torch.device,
+        detector: ObstacleDetector,
+        profile_name: str = "cpu",
+        onnx_session: Optional[Any] = None,
+    ) -> None:
         self.cfg = cfg
+        self.profile_name = profile_name
         self.device = device
         self.model = model.to(device).eval()
-        if self.device.type == "cuda":
+        if device.type == "cuda":
             self.model = self.model.half()
-            
+
+        self.onnx_session = onnx_session
+
+
         self.detector = detector
-        self.size = tuple(cfg["inference"]["input_size"])  # (H, W) = (288, 512)
-        self.mean = np.asarray(cfg["data"]["imagenet_mean"], np.float32)
-        self.std = np.asarray(cfg["data"]["imagenet_std"], np.float32)
         self.classical = ClassicalFreeSpaceEstimator(cfg["classical"])
-        self.fusion = fusion or ATWFS(cfg["fusion"])
+        self.fusion = ATWFS(cfg["fusion"])
+        self.ipm = InversePerspectiveMapping(cfg["camera"])
+        self.ipm_every_n = int(cfg.get("inference", {}).get("ipm_every_n", 10 if device.type == "cpu" else 5))
+        self.fallback_alpha_gate = float(cfg.get("inference", {}).get("fallback_alpha_gate", 0.8))
+
+        self.mean = np.array(cfg["data"]["imagenet_mean"], dtype=np.float32).reshape(1, 1, 3)
+        self.std = np.array(cfg["data"]["imagenet_std"], dtype=np.float32).reshape(1, 1, 3)
+        self.input_size = tuple(cfg["inference"].get("input_size", cfg["data"]["image_size"]))
+
         self.prev_dl_mask: Optional[np.ndarray] = None
-        self._logged_unc_fallback = False
-        
-        self.mask_history = collections.deque(maxlen=5)
-        
-        # Timing stats
-        self.timings = collections.defaultdict(float)
-        
-        # Hood polygon setup
-        self.hood_poly_norm = np.array(cfg["inference"].get("hood_polygon", [[0.0, 1.0], [0.1, 0.75], [0.9, 0.75], [1.0, 1.0]]))
-        self.hood_poly_model = None
-        self.ipm = InversePerspectiveMapping(cfg)
-        
-        # Night mode state & hysteresis debounce
-        night_cfg = cfg["inference"].get("night_mode", {})
+        self.mask_history: Deque[np.ndarray] = collections.deque(maxlen=3)
+        self.timings: Dict[str, float] = collections.defaultdict(float)
+        self.stage_samples: Dict[str, List[float]] = collections.defaultdict(list)
+
+        hood_pts = cfg["inference"].get("hood_polygon", [[0.0, 1.0], [0.15, 0.75], [0.85, 0.75], [1.0, 1.0]])
+        self.hood_poly_norm = np.array(hood_pts, dtype=np.float32)
+        self.hood_poly_model: Optional[np.ndarray] = None
+
+        # Low-light / night mode state
+        night_cfg = cfg.get("inference", {}).get("night_mode", {})
         self.night_mode_enabled = bool(night_cfg.get("enabled", True))
         self.night_thresh_low = float(night_cfg.get("threshold_low", 45.0))
         self.night_thresh_high = float(night_cfg.get("threshold_high", 60.0))
         self.night_debounce_frames = int(night_cfg.get("debounce_frames", 10))
-        self.current_mode = "day"
         self.night_debounce_counter = 0
-        if hasattr(self.model, "add_night_decoder"):
-            self.model.add_night_decoder()
+        self.current_mode = "day"
+        self._last_luma = 100.0
 
-    @torch.inference_mode()
-    def process_frame(self, frame_bgr: np.ndarray, speed_mps: Optional[float] = None, frame_idx: int = 0,
-                      imu_sample: Optional[Dict[str, float]] = None, dt: float = 0.04) -> FrameResult:
-        cfg = self.cfg
-        speed = cfg["inference"]["speed_mps_input"] if speed_mps is None else speed_mps
+        # Steering history for rate limiting and EMA
+        self.prev_steer_angle: Optional[float] = None
+
+        # Segmentation skipping cadence
+        self.seg_every = max(1, int(cfg.get("inference", {}).get("seg_every", 2 if profile_name == "cpu" else 1)))
+        self.last_raw_mask: Optional[np.ndarray] = None
+        self.last_fused_alpha: float = 1.0
+        self.last_active: str = "DL"
+        self.last_unc: float = 0.05
+        self.last_geo: float = 0.95
+        self.last_tmp: float = 1.0
+        self.last_terrain: int = 0
+
+    def process_frame(
+        self,
+        frame_bgr: np.ndarray,
+        frame_idx: int = 0,
+        dt: float = 0.04,
+        speed: float = 1.0,
+        imu_sample: Optional[Dict[str, float]] = None,
+    ) -> FrameResult:
         fh, fw = frame_bgr.shape[:2]
-        mh, mw = self.size
-        
-        # Letterbox
+        mh, mw = self.input_size
+        t_stage0 = time.perf_counter()
+
+        # 1. PREPROCESS
         scale = min(mw / fw, mh / fh)
-        nw, nh = int(fw * scale), int(fh * scale)
+        nw, nh = int(round(fw * scale)), int(round(fh * scale))
         small = cv2.resize(frame_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
+
         padded = np.zeros((mh, mw, 3), dtype=np.uint8)
-        
         pad_top = (mh - nh) // 2
         pad_left = (mw - nw) // 2
         padded[pad_top:pad_top + nh, pad_left:pad_left + nw] = small
-        
-        # Hood masking on model input
+
         if self.hood_poly_model is None:
             self.hood_poly_model = np.zeros_like(self.hood_poly_norm, dtype=np.int32)
             self.hood_poly_model[:, 0] = self.hood_poly_norm[:, 0] * mw
             self.hood_poly_model[:, 1] = self.hood_poly_norm[:, 1] * mh
-            
-        # Sample patch just above hood for mean road color
-        # Get hood apex
+
         apex_y = np.min(self.hood_poly_model[:, 1])
         patch_y1, patch_y2 = max(0, int(apex_y - 20)), int(apex_y)
-        patch_x1, patch_x2 = int(mw/2 - 20), int(mw/2 + 20)
-        
-        road_color = (128, 128, 128)
+        patch_x1, patch_x2 = int(mw / 2 - 20), int(mw / 2 + 20)
+        road_color = [128, 128, 128]
         if patch_y2 > patch_y1:
             patch = padded[patch_y1:patch_y2, patch_x1:patch_x2]
             if patch.size > 0:
                 road_color = patch.mean(axis=(0, 1)).astype(int).tolist()
-                
         cv2.fillPoly(padded, [self.hood_poly_model], road_color)
-        
-        # Low-light / night mode detection via road region mean luminance
+
+        # Night mode luma check on model-resolution image (every 5th frame)
         if self.night_mode_enabled:
-            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-            if self.prev_dl_mask is not None and np.count_nonzero(self.prev_dl_mask) > 50:
-                m_resized = cv2.resize(self.prev_dl_mask, (fw, fh), interpolation=cv2.INTER_NEAREST)
-                road_luma = float(np.mean(gray[m_resized > 0]))
-            else:
-                road_luma = float(np.mean(gray[int(fh * 0.50):int(fh * 0.70), int(fw * 0.30):int(fw * 0.70)]))
-            
-            # Hysteresis + 10-frame debounce
+            if (frame_idx % 5 == 0) or (self.night_debounce_counter > 0):
+                gray_small = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                if self.prev_dl_mask is not None and np.count_nonzero(self.prev_dl_mask) > 50:
+                    self._last_luma = float(np.mean(gray_small[self.prev_dl_mask > 0]))
+                else:
+                    self._last_luma = float(np.mean(gray_small[int(nh * 0.50):int(nh * 0.70), int(nw * 0.30):int(nw * 0.70)]))
+
             if self.current_mode == "day":
-                if road_luma < self.night_thresh_low:
+                if self._last_luma < self.night_thresh_low:
                     self.night_debounce_counter += 1
                     if self.night_debounce_counter >= self.night_debounce_frames:
                         self.current_mode = "night"
@@ -140,155 +165,284 @@ class LivePipeline:
                 else:
                     self.night_debounce_counter = 0
             else:
-                if road_luma > self.night_thresh_high:
+                if self._last_luma > self.night_thresh_high:
                     self.night_debounce_counter += 1
                     if self.night_debounce_counter >= self.night_debounce_frames:
                         self.current_mode = "day"
                         self.night_debounce_counter = 0
                 else:
                     self.night_debounce_counter = 0
-            
+
             if hasattr(self.model, "set_mode"):
                 self.model.set_mode(self.current_mode)
 
-        t0 = time.time()
-        x = (cv2.cvtColor(padded, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0 - self.mean) / self.std
-        x_tensor = torch.from_numpy(x.transpose(2, 0, 1)).unsqueeze(0).to(self.device)
-        if self.device.type == "cuda":
-            x_tensor = x_tensor.half()
-        self.timings["preprocess"] += time.time() - t0
-        
-        t0 = time.time()
-        out = self.model(x_tensor)
-        dl_mask_padded = out["seg_logits"].argmax(1)[0].byte().cpu().numpy()
-        unc = float(evidential_uncertainty(out["alpha"]).mean().item())
-        
-        if unc < 0.01:
-            if not getattr(self, "_logged_unc_fallback", False):
-                logger.info("Evidential uncertainty is ~0, falling back to normalized entropy.")
-                self._logged_unc_fallback = True
-            probs = torch.softmax(out["seg_logits"], dim=1)
-            unc = float((-(probs * torch.log(probs + 1e-6)).sum(dim=1) / np.log(probs.shape[1])).mean().cpu().item())
-            
-        if cfg["inference"].get("use_terrain", False):
-            terrain = int(out["terrain_logits"].argmax(1)[0].item())
-        else:
-            terrain = 0
-        self.timings["model"] += time.time() - t0
-        
-        dl_mask = dl_mask_padded[pad_top:pad_top + nh, pad_left:pad_left + nw]
+        # Check if segmentation forward pass is skipped
+        skip_seg = (self.seg_every > 1) and (frame_idx % self.seg_every != 0) and (self.last_raw_mask is not None)
 
-        t0 = time.time()
-        
-        # Ego seed check: sample just above hood
-        geo = geometric_score(dl_mask, cfg["consistency"]["geometric"], apex_y=int(apex_y - pad_top))
-        
-
-        tmp = temporal_score(self.prev_dl_mask, dl_mask, speed, cfg["consistency"]["temporal"])
-        self.prev_dl_mask = dl_mask.copy()
-        
-        alpha = self.fusion.alpha(unc, geo, tmp, terrain)
-        if alpha < 0.8:
-            fb_mask_padded = self.classical.estimate(padded)
-            fb_mask = fb_mask_padded[pad_top:pad_top + nh, pad_left:pad_left + nw]
+        if skip_seg:
+            mask = self.last_raw_mask.copy()
+            unc = self.last_unc
+            geo = self.last_geo
+            tmp = self.last_tmp
+            terrain = self.last_terrain
+            active_str = self.last_active
+            fused_alpha = self.last_fused_alpha
+            self.stage_samples["preprocess"].append(0.0)
+            self.stage_samples["model"].append(0.0)
+            self.stage_samples["classical"].append(0.0)
         else:
-            fb_mask = np.zeros_like(dl_mask)
-            
-        fused = self.fusion.fuse(dl_mask, fb_mask, unc, geo, tmp, terrain)
-        mask = fused.mask
-        self.timings["classical_fusion"] += time.time() - t0
-        
-        t0 = time.time()
-        # Post-process
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+            # Tensor conversion & Forward pass
+            if self.onnx_session is not None:
+                x_norm = (cv2.cvtColor(padded, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0 - self.mean) / self.std
+                x_np = x_norm.transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
+
+                t_prep_ms = (time.perf_counter() - t_stage0) * 1000.0
+                self.timings["preprocess"] += t_prep_ms / 1000.0
+                self.stage_samples["preprocess"].append(t_prep_ms)
+
+                # 2. MODEL FORWARD (ONNX)
+                t_stage0 = time.perf_counter()
+                seg_logits_np, alpha_np = self.onnx_session.run(None, {"image": x_np})
+                s_arr = np.sum(alpha_np, axis=1, keepdims=True)
+                unc = float(np.mean(2.0 / np.maximum(1e-6, s_arr)))
+                if unc < 0.01:
+                    e_x = np.exp(seg_logits_np - np.max(seg_logits_np, axis=1, keepdims=True))
+                    probs = e_x / np.sum(e_x, axis=1, keepdims=True)
+                    log_k = np.log(probs.shape[1])
+                    ent = -np.sum(probs * np.log(probs + 1e-6), axis=1) / log_k
+                    unc = float(np.mean(ent))
+
+                dl_mask_padded = np.argmax(seg_logits_np, axis=1)[0].astype(np.uint8)
+                terrain = 0
+
+                t_mod_ms = (time.perf_counter() - t_stage0) * 1000.0
+                self.timings["model"] += t_mod_ms / 1000.0
+                self.stage_samples["model"].append(t_mod_ms)
+            else:
+                if self.device.type == "cuda":
+                    # GPU letterbox, norm and fp16
+                    t_u8 = torch.from_numpy(padded).to(self.device, non_blocking=True)
+                    x_tensor = t_u8.permute(2, 0, 1).unsqueeze(0).half() / 255.0
+                    x_tensor = (x_tensor - torch.tensor(self.mean.reshape(3, 1, 1), device=self.device).half()) / torch.tensor(self.std.reshape(3, 1, 1), device=self.device).half()
+                    torch.cuda.synchronize()
+                else:
+                    x = (cv2.cvtColor(padded, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0 - self.mean) / self.std
+                    x_tensor = torch.from_numpy(x.transpose(2, 0, 1)).unsqueeze(0).to(self.device, memory_format=torch.channels_last)
+
+                t_prep_ms = (time.perf_counter() - t_stage0) * 1000.0
+                self.timings["preprocess"] += t_prep_ms / 1000.0
+                self.stage_samples["preprocess"].append(t_prep_ms)
+
+                # 2. MODEL FORWARD (PyTorch)
+                t_stage0 = time.perf_counter()
+                with torch.inference_mode():
+                    out = self.model(x_tensor)
+                    seg_logits = out["seg_logits"]
+                    alpha_tensor = out["alpha"]
+
+                    # Compute evidential uncertainty and entropy fallback in single GPU/CPU reduction
+                    u_t = evidential_uncertainty(alpha_tensor)
+                    unc = float(u_t.mean().item())
+                    if unc < 0.01:
+                        probs = torch.softmax(seg_logits, dim=1)
+                        log_k = np.log(probs.shape[1])
+                        ent = (-(probs * torch.log(probs + 1e-6)).sum(dim=1) / log_k).mean()
+                        unc = float(ent.item())
+
+                    dl_mask_padded = seg_logits.argmax(1)[0].byte().cpu().numpy()
+                    if self.cfg["inference"].get("use_terrain", False) and "terrain_logits" in out:
+                        terrain = int(out["terrain_logits"].argmax(1)[0].item())
+                    else:
+                        terrain = 0
+
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize()
+                t_mod_ms = (time.perf_counter() - t_stage0) * 1000.0
+                self.timings["model"] += t_mod_ms / 1000.0
+                self.stage_samples["model"].append(t_mod_ms)
+
+            dl_mask = dl_mask_padded[pad_top:pad_top + nh, pad_left:pad_left + nw]
+
+            # 3. CLASSICAL & FUSION
+            t_stage0 = time.perf_counter()
+            geo = geometric_score(dl_mask, self.cfg["consistency"]["geometric"], apex_y=int(apex_y - pad_top))
+            tmp = temporal_score(self.prev_dl_mask, dl_mask, speed, self.cfg["consistency"]["temporal"])
+            self.prev_dl_mask = dl_mask.copy()
+
+            alpha_val = self.fusion.alpha(unc, geo, tmp, terrain)
+            if alpha_val < self.fallback_alpha_gate:
+                fb_mask_padded = self.classical.estimate(padded)
+                fb_mask = fb_mask_padded[pad_top:pad_top + nh, pad_left:pad_left + nw]
+            else:
+                fb_mask = np.zeros_like(dl_mask)
+
+            fused = self.fusion.fuse(dl_mask, fb_mask, unc, geo, tmp, terrain)
+            mask = fused.mask
+            active_str = fused.active
+            fused_alpha = fused.alpha
+            t_cf_ms = (time.perf_counter() - t_stage0) * 1000.0
+            self.timings["classical_fusion"] += t_cf_ms / 1000.0
+            self.stage_samples["classical"].append(t_cf_ms)
+
+            self.last_raw_mask = mask.copy()
+            self.last_fused_alpha = fused_alpha
+            self.last_active = active_str
+            self.last_unc = unc
+            self.last_geo = geo
+            self.last_tmp = tmp
+            self.last_terrain = terrain
+
+        # 4. POST-PROCESS AT MODEL RESOLUTION
+        t_stage0 = time.perf_counter()
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        
-        # Mask out hood poly on OUTPUT mask at model resolution
+
         hp_model_adj = self.hood_poly_model.copy()
         hp_model_adj[:, 0] -= pad_left
         hp_model_adj[:, 1] -= pad_top
         cv2.fillPoly(mask, [hp_model_adj], 0)
-        
-        # Largest connected component nearest bottom center
+
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
         if num_labels > 1:
             target_pt = np.array([nw / 2.0, nh])
             best_label = 1
-            min_dist = float('inf')
+            min_dist = float("inf")
             for i in range(1, num_labels):
-                if stats[i, cv2.CC_STAT_AREA] < 100: continue
+                if stats[i, cv2.CC_STAT_AREA] < 50:
+                    continue
                 dist = np.linalg.norm(centroids[i] - target_pt)
                 if dist < min_dist:
                     min_dist = dist
                     best_label = i
-            if min_dist < float('inf'):
-                mask = (labels == best_label).astype(np.uint8)
-            else:
-                mask = np.zeros_like(mask)
-                
-        # Temporal smoothing (majority vote)
+            mask = (labels == best_label).astype(np.uint8) if min_dist < float("inf") else np.zeros_like(mask)
+
         self.mask_history.append(mask)
         if len(self.mask_history) > 2:
             sum_mask = np.sum(self.mask_history, axis=0)
             mask = (sum_mask > len(self.mask_history) // 2).astype(np.uint8)
-            
-        self.timings["postprocess"] += time.time() - t0
 
-        t0 = time.time()
+        t_post_ms = (time.perf_counter() - t_stage0) * 1000.0
+        self.timings["postprocess"] += t_post_ms / 1000.0
+        self.stage_samples["postprocess"].append(t_post_ms)
+
+        # 5. YOLO DETECTIONS
+        t_stage0 = time.perf_counter()
         dets = self.detector.detect(frame_bgr, frame_idx)
-        
-        # Ignore detections inside hood
+
+        # Ignore detections inside hood polygon
         hp_fw_fh = np.zeros_like(self.hood_poly_norm, dtype=np.int32)
         hp_fw_fh[:, 0] = self.hood_poly_norm[:, 0] * fw
         hp_fw_fh[:, 1] = self.hood_poly_norm[:, 1] * fh
-        
-        valid_dets = []
-        for d in dets:
-            if cv2.pointPolygonTest(hp_fw_fh, (d.center_x, d.center_y), False) < 0:
-                valid_dets.append(d)
+        valid_dets = [d for d in dets if cv2.pointPolygonTest(hp_fw_fh, (d.center_x, d.center_y), False) < 0]
         dets = valid_dets
-        self.timings["yolo"] += time.time() - t0
 
-        mask = cv2.resize(mask, (fw, fh), interpolation=cv2.INTER_NEAREST)
-        raw_mask = mask.copy()
-        
-        # Self-calibrating IPM (bird's-eye view)
-        t_ipm0 = time.time()
-        ipm_res = self.ipm.process_frame(frame_bgr, mask, dt=dt, imu_sample=imu_sample)
-        self.timings["ipm"] += time.time() - t_ipm0
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        t_yolo_ms = (time.perf_counter() - t_stage0) * 1000.0
+        self.timings["yolo"] += t_yolo_ms / 1000.0
+        self.stage_samples["YOLO"].append(t_yolo_ms)
 
-        # Create hood map for decision logic (don't compute path in hood)
-        # Decision.py logic already takes topmost mask, which is 0 in hood area.
-        mask = subtract_obstacles(mask, dets, cfg["inference"]["decision"]["obstacle_dilate_px"])
-        cmd = compute_command(
-            mask, dets, fused.alpha, terrain, cfg["inference"]["decision"],
-            raw_mask=raw_mask,
-            road_width_m=ipm_res.road_width_m,
-            lateral_offset_m=ipm_res.lateral_offset_m
+        # 6. MODEL-RESOLUTION OBSTACLE SUBTRACTION & IPM
+        t_stage0 = time.perf_counter()
+        scale_x = float(nw) / max(1.0, float(fw))
+        scale_y = float(nh) / max(1.0, float(fh))
+        dets_model = [
+            Detection(
+                x1=int(round(d.x1 * scale_x)),
+                y1=int(round(d.y1 * scale_y)),
+                x2=int(round(d.x2 * scale_x)),
+                y2=int(round(d.y2 * scale_y)),
+                cls_id=d.cls_id,
+                name=d.name,
+                conf=d.conf,
+                kind=d.kind,
+                approach_rate=d.approach_rate,
+                tracker_id=d.tracker_id,
+            )
+            for d in dets
+        ]
+
+        # Subtract obstacles on model-resolution mask
+        dilate_model = max(1, int(round(self.cfg["inference"]["decision"]["obstacle_dilate_px"] * scale_x)))
+        mask_sub = subtract_obstacles(mask, dets_model, dilate_model)
+
+        # Run IPM on small model-resolution image and mask
+        ipm_res = self.ipm.process_frame(
+            small,
+            mask_sub,
+            dt=dt,
+            imu_sample=imu_sample,
+            frame_idx=frame_idx,
+            horizon_every_n=self.ipm_every_n,
         )
-        
-        return FrameResult(mask, cmd, fused.active, unc, geo, tmp, terrain, dets, ipm=ipm_res, mode=self.current_mode)
+        t_ipm_ms = (time.perf_counter() - t_stage0) * 1000.0
+        self.timings["ipm"] += t_ipm_ms / 1000.0
+        self.stage_samples["IPM"].append(t_ipm_ms)
 
-def is_overlap(r1, r2):
+        # 7. COMPUTE DECISION COMMAND
+        cmd = compute_command(
+            mask_sub,
+            dets_model,
+            fused_alpha,
+            terrain,
+            self.cfg["inference"]["decision"],
+            raw_mask=mask,
+            road_width_m=ipm_res.road_width_m,
+            lateral_offset_m=ipm_res.lateral_offset_m,
+            prev_angle=self.prev_steer_angle,
+        )
+        self.prev_steer_angle = cmd.angle
+
+        # Upscale mask to output resolution ONCE only for final drawing
+        mask_full = cv2.resize(mask, (fw, fh), interpolation=cv2.INTER_NEAREST)
+
+        return FrameResult(
+            mask=mask_full,
+            command=cmd,
+            active=active_str,
+            uncertainty=unc,
+            geometric=geo,
+            temporal=tmp,
+            terrain=terrain,
+            detections=dets,
+            ipm=ipm_res,
+            mode=self.current_mode,
+            mask_model=mask,
+        )
+
+
+def is_overlap(r1: Sequence[int], r2: Sequence[int]) -> bool:
     return not (r1[0] >= r2[2] or r1[2] <= r2[0] or r1[1] >= r2[3] or r1[3] <= r2[1])
 
-def annotate(frame_bgr: np.ndarray, res: FrameResult, skipped: bool = False,
-             frame_idx: int = 0, total_frames: Optional[int] = None, fps: float = 0.0,
-             state: Optional[Dict[str, Any]] = None, cfg: Optional[Dict[str, Any]] = None) -> np.ndarray:
-    if state is None: state = {}
-    if cfg is None: cfg = {}
+
+def annotate(
+    frame_bgr: np.ndarray,
+    res: FrameResult,
+    skipped: bool = False,
+    frame_idx: int = 0,
+    total_frames: Optional[int] = None,
+    fps: float = 0.0,
+    state: Optional[Dict[str, Any]] = None,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> np.ndarray:
+    """Fast HUD and drivable free-space annotation with bounding-rectangle blending."""
+    if state is None:
+        state = {}
+    if cfg is None:
+        cfg = {}
+
     out = frame_bgr.copy()
     h, w = out.shape[:2]
-    
     s = max(w / 1280.0, 0.5)
     thickness = max(1, int(round(2 * s)))
     font_scale = min(0.7 * s, 0.55)
-    
+
     colors = cfg.get("inference", {}).get("colors", {})
-    def get_color(name, default):
+
+    def get_color(name: str, default: List[int]) -> Tuple[int, int, int]:
         c = colors.get(name, default)
-        return (c[2], c[1], c[0]) # RGB to BGR
-        
+        return (c[2], c[1], c[0])  # RGB -> BGR
+
     c_drivable = get_color("drivable", [30, 144, 255])
     c_hood = get_color("hood", [40, 40, 40])
     c_veh_def = get_color("vehicle_default", [0, 255, 255])
@@ -298,115 +452,129 @@ def annotate(frame_bgr: np.ndarray, res: FrameResult, skipped: bool = False,
     c_animal = get_color("animal", [128, 0, 128])
     c_tiny = get_color("tiny", [128, 128, 128])
 
-    # Draw drivable mask
-    overlay = out.copy()
-    overlay[res.mask > 0] = c_drivable
-    cv2.addWeighted(overlay, 0.35, out, 0.65, 0, out)
-    
-    contours, _ = cv2.findContours(res.mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cv2.drawContours(out, contours, -1, (255, 255, 255), thickness, cv2.LINE_AA)
-    
-    # Draw hood
-    hood_poly = np.array(cfg["inference"].get("hood_polygon", [[0.0, 1.0], [0.1, 0.75], [0.9, 0.75], [1.0, 1.0]]))
+    # 1. Fast mask overlay: blend only on the mask's bounding box
+    nz_y, nz_x = np.nonzero(res.mask)
+    if len(nz_y) > 0:
+        y1, y2 = int(np.min(nz_y)), int(np.max(nz_y)) + 1
+        x1, x2 = int(np.min(nz_x)), int(np.max(nz_x)) + 1
+        roi = out[y1:y2, x1:x2]
+        roi_m = res.mask[y1:y2, x1:x2] > 0
+        if np.any(roi_m):
+            overlay_roi = roi.copy()
+            overlay_roi[roi_m] = c_drivable
+            cv2.addWeighted(overlay_roi, 0.35, roi, 0.65, 0, roi)
+
+        if getattr(res, "mask_model", None) is not None:
+            mh, mw = res.mask_model.shape[:2]
+            cnts, _ = cv2.findContours(res.mask_model, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            scale_x = float(w) / float(mw)
+            scale_y = float(h) / float(mh)
+            scaled_cnts = [np.round(c * np.array([scale_x, scale_y], dtype=np.float32)).astype(np.int32) for c in cnts]
+            cv2.drawContours(out, scaled_cnts, -1, (255, 255, 255), thickness, cv2.LINE_AA)
+        else:
+            contours, _ = cv2.findContours(res.mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(out, contours, -1, (255, 255, 255), thickness, cv2.LINE_AA)
+
+    # 2. Fast hood overlay: blend only on the hood bounding box
+    hood_poly = np.array(cfg.get("inference", {}).get("hood_polygon", [[0.0, 1.0], [0.1, 0.75], [0.9, 0.75], [1.0, 1.0]]))
     hp_px = np.zeros_like(hood_poly, dtype=np.int32)
     hp_px[:, 0] = hood_poly[:, 0] * w
     hp_px[:, 1] = hood_poly[:, 1] * h
-    overlay_hood = out.copy()
-    cv2.fillPoly(overlay_hood, [hp_px], c_hood)
-    cv2.addWeighted(overlay_hood, 0.5, out, 0.5, 0, out)
+    hp_y1 = int(np.min(hp_px[:, 1]))
+    if hp_y1 < h:
+        roi_hood = out[hp_y1:, :]
+        overlay_hood = roi_hood.copy()
+        hp_shifted = hp_px.copy()
+        hp_shifted[:, 1] -= hp_y1
+        cv2.fillPoly(overlay_hood, [hp_shifted], c_hood)
+        cv2.addWeighted(overlay_hood, 0.5, roi_hood, 0.5, 0, roi_hood)
 
-    # Center path
+    # 3. Center path above the hood line
     band = cfg.get("inference", {}).get("decision", {}).get("lookahead_rows", [0.55, 0.9])
     y_start, y_end = int(band[0] * h), int(band[1] * h)
-    
-    # Find topmost hood y at center to restrict path
     apex_y = int(np.min(hp_px[:, 1]))
     if y_end > apex_y:
         y_end = apex_y
-        
+
     if y_end > y_start and res.mask[y_start:y_end].any():
         c_pts = []
-        for y in range(y_start, y_end, max(1, (y_end - y_start) // 10)):
+        step = max(1, (y_end - y_start) // 10)
+        for y in range(y_start, y_end, step):
             row = res.mask[y]
             nz = np.nonzero(row)[0]
             if len(nz) > 0:
-                cx = np.mean(nz)
-                c_pts.append((cx, y))
-        
+                c_pts.append((float(np.mean(nz)), float(y)))
+
         if len(c_pts) >= 2:
             pts = np.array(c_pts, dtype=np.float32)
-            ema_x = cfg.get("inference", {}).get("overlay", {}).get("ema_x", 0.35)
+            ema_x = float(cfg.get("inference", {}).get("overlay", {}).get("ema_x", 0.35))
             if "ema_pts" not in state or state["ema_pts"].shape != pts.shape:
                 state["ema_pts"] = pts
             else:
-                state["ema_pts"] = ema_x * pts + (1 - ema_x) * state["ema_pts"]
-            
+                state["ema_pts"] = ema_x * pts + (1.0 - ema_x) * state["ema_pts"]
+
             p = state["ema_pts"].astype(np.int32)
             cv2.polylines(out, [p], False, (0, 0, 0), thickness + 2, cv2.LINE_AA)
             cv2.polylines(out, [p], False, (0, 255, 255), thickness, cv2.LINE_AA)
             cv2.arrowedLine(out, tuple(p[-2]), tuple(p[-1]), (0, 0, 0), thickness + 2, cv2.LINE_AA, tipLength=0.2)
             cv2.arrowedLine(out, tuple(p[-2]), tuple(p[-1]), (0, 255, 255), thickness, cv2.LINE_AA, tipLength=0.2)
     else:
-        if "ema_pts" in state: del state["ema_pts"]
+        state.pop("ema_pts", None)
 
-    placed_rects = []
-    
-    # Draw Detections
+    placed_rects: List[List[int]] = []
+
+    # 4. Obstacle bounding boxes and non-overlapping labels
+    corridor_hw = float(cfg.get("inference", {}).get("decision", {}).get("corridor_half_width", 0.2)) * w
     for d in res.detections:
         if d.height < 0.03 * h:
             cv2.rectangle(out, (d.x1, d.y1), (d.x2, d.y2), c_tiny, 1)
             continue
-            
-        color = c_veh_def
-        if d.kind == "person": color = c_person
-        elif d.kind == "animal": color = c_animal
+
+        if d.kind == "person":
+            color = c_person
+        elif d.kind == "animal":
+            color = c_animal
         else:
-            if res.command.obstacle_flag and res.command.obstacle_proximity > 0 and d.approach_rate > 1.0: 
-                # simplification: if it's the obstacle causing the flag
+            if res.command.obstacle_flag and res.command.obstacle_proximity > 0 and d.approach_rate > 1.0:
                 color = c_veh_obs
-            elif d.approach_rate > 1.05 or abs(d.center_x - w/2) < cfg.get("inference", {}).get("decision", {}).get("corridor_half_width", 0.2) * w:
+            elif d.approach_rate > 1.05 or abs(d.center_x - w / 2.0) < corridor_hw:
                 color = c_veh_app
-                
+            else:
+                color = c_veh_def
+
         cv2.rectangle(out, (d.x1, d.y1), (d.x2, d.y2), color, thickness)
-        
         label = f"{d.name} {d.conf:.2f}"
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-        
-        # Label placement without overlap
+
         lbl_x, lbl_y = d.x1, d.y1 - 5
         rect = [lbl_x, lbl_y - th - 3, lbl_x + tw, lbl_y + 3]
-        
-        # HUD area (top left 350x250 approx)
-        hud_rect = [0, 0, int(350 * s), int(250 * s)]
-        
+        hud_rect = [0, 0, int(380 * s), int(260 * s)]
+
         attempts = 0
         while (any(is_overlap(rect, pr) for pr in placed_rects) or is_overlap(rect, hud_rect)) and attempts < 10:
             attempts += 1
-            # Move up
             rect[1] -= th + 5
             rect[3] -= th + 5
             lbl_y -= th + 5
             if rect[1] < 0:
-                # Move below
                 lbl_y = d.y2 + th + 5
                 rect = [lbl_x, lbl_y - th - 3, lbl_x + tw, lbl_y + 3]
                 if any(is_overlap(rect, pr) for pr in placed_rects) or is_overlap(rect, hud_rect):
-                    # Move right
                     shift_dx = max(30, int(tw + 10))
                     rect[0] += shift_dx
                     rect[2] += shift_dx
                     lbl_x += shift_dx
-        
+
         placed_rects.append(rect)
         cv2.rectangle(out, (rect[0], rect[1]), (rect[2], rect[3]), (0, 0, 0), -1)
         cv2.putText(out, label, (lbl_x, lbl_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
+    # 5. HUD Information Box
     frames_str = f"{frame_idx}/{total_frames}" if total_frames else f"{frame_idx}"
     ang = res.command.angle
     curve = "STRAIGHT" if abs(ang) < 5 else ("RIGHT SHARP" if ang > 15 else ("RIGHT" if ang > 5 else ("LEFT SHARP" if ang < -15 else "LEFT")))
-    
     width_text = f"ROAD WIDTH: {res.command.width_m:.2f} m" if res.command.width_m is not None else f"ROAD WIDTH: {res.command.width_frac * 100.0:.1f}%"
-    
+
     lines = [
         f"ATWFS DRIVABLE REGION | FRAME: {frames_str} | {fps:.1f} FPS",
         f"ESTIMATOR: {res.active}   TRUST: {res.command.trust:.2f}   MODE: {res.mode.upper()}",
@@ -417,20 +585,28 @@ def annotate(frame_bgr: np.ndarray, res: FrameResult, skipped: bool = False,
     if res.ipm and res.ipm.valid:
         lines.append(f"IPM: {res.ipm.method.upper()} (P:{res.ipm.pitch_deg:+.1f} deg R:{res.ipm.roll_deg:+.1f} deg)")
     lines.append("LEGEND: Blu=Drivable Yel=Path Cy=Veh Org=App/In-corr Red=Obs")
-    
+
     y = int(25 * s)
     for line in lines:
         (tw, th), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-        cv2.rectangle(out, (int(15*s) - 2, y - th - 3), (int(15*s) + tw + 2, y + 3), (0, 0, 0), -1)
-        cv2.putText(out, line, (int(15*s), y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        cv2.rectangle(out, (int(15 * s) - 2, y - th - 3), (int(15 * s) + tw + 2, y + 3), (0, 0, 0), -1)
+        cv2.putText(out, line, (int(15 * s), y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
         y += int(30 * s)
 
     return out
 
+
 class FrameGrabber(threading.Thread):
-    def __init__(self, source: Union[int, str], out_q: "queue.Queue", stop: threading.Event, live: bool,
-                 max_frames: Optional[int] = None, max_width: Optional[int] = None) -> None:
-        super().__init__()
+    def __init__(
+        self,
+        source: Union[int, str],
+        out_q: "queue.Queue",
+        stop: threading.Event,
+        live: bool,
+        max_frames: Optional[int] = None,
+        max_width: Optional[int] = None,
+    ) -> None:
+        super().__init__(daemon=True)
         self.cap = cv2.VideoCapture(source)
         if not self.cap.isOpened():
             raise RuntimeError(f"Could not open {source}")
@@ -445,15 +621,18 @@ class FrameGrabber(threading.Thread):
     def run(self) -> None:
         count = 0
         while not self.stop.is_set():
+            t_r0 = time.perf_counter()
             ret, frame = self.cap.read()
             if not ret:
                 break
             if count == 0:
                 print(f"First-frame resolution: {frame.shape[1]}x{frame.shape[0]}")
-            
+
             if self.max_width and frame.shape[1] > self.max_width:
                 scale = self.max_width / frame.shape[1]
-                frame = cv2.resize(frame, (self.max_width, int(frame.shape[0] * scale)))
+                frame = cv2.resize(frame, (self.max_width, int(round(frame.shape[0] * scale))), interpolation=cv2.INTER_AREA)
+
+            t_read_ms = (time.perf_counter() - t_r0) * 1000.0
 
             if self.live:
                 if self.out_q.full():
@@ -461,41 +640,57 @@ class FrameGrabber(threading.Thread):
                         self.out_q.get_nowait()
                     except queue.Empty:
                         pass
-                self.out_q.put(frame, timeout=1.0)
+                self.out_q.put((count, frame, t_read_ms), timeout=1.0)
             else:
-                self.out_q.put(frame)
+                self.out_q.put((count, frame, t_read_ms))
+
             count += 1
             if self.max_frames and count >= self.max_frames:
                 break
+
         self.out_q.put(None)
         self.cap.release()
 
+
 class InferenceWorker(threading.Thread):
-    def __init__(self, pipeline: LivePipeline, in_q: "queue.Queue", out_q: "queue.Queue",
-                 stop: threading.Event, skip: int, errors: List[BaseException], total_frames: Optional[int],
-                 imu_reader: Optional[IMUReader] = None) -> None:
-        super().__init__()
-        self.p, self.in_q, self.out_q, self.stop, self.skip = pipeline, in_q, out_q, stop, max(1, skip)
+    def __init__(
+        self,
+        pipeline: LivePipeline,
+        in_q: "queue.Queue",
+        out_q: "queue.Queue",
+        stop: threading.Event,
+        skip: int,
+        errors: List[BaseException],
+        total_frames: Optional[int],
+        imu_reader: Optional[IMUReader] = None,
+    ) -> None:
+        super().__init__(daemon=True)
+        self.p = pipeline
+        self.in_q = in_q
+        self.out_q = out_q
+        self.stop = stop
+        self.skip = max(1, skip)
         self.errors = errors
-        self.annot_state: Dict[str, Any] = {}
         self.total_frames = total_frames
         self.imu_reader = imu_reader
 
     def run(self) -> None:
-        idx, last_frame, last_res, last_annot = 0, None, None, None
-        fps_q = collections.deque(maxlen=30)
-        t_last = time.time()
-        
+        last_res = None
         try:
             while not self.stop.is_set():
-                t_read0 = time.time()
-                frame = self.in_q.get()
-                self.p.timings["read"] += time.time() - t_read0
-                
-                if frame is None:
+                item = self.in_q.get()
+                if item is None:
                     break
-                
-                t_start = time.time()
+
+                if len(item) == 3:
+                    idx, frame, t_read_ms = item
+                else:
+                    idx, frame = item
+                    t_read_ms = 0.0
+
+                self.p.timings["read"] += t_read_ms / 1000.0
+                self.p.stage_samples["read"].append(t_read_ms)
+
                 is_skip = (idx % self.skip != 0)
                 if not is_skip or last_res is None:
                     imu_sample = self.imu_reader.get_sample(idx) if self.imu_reader else None
@@ -503,45 +698,15 @@ class InferenceWorker(threading.Thread):
                     last_res = res
                 else:
                     res = last_res
-                
-                t_annot0 = time.time()
-                fps = sum(fps_q) / len(fps_q) if fps_q else 0.0
-                annotated = annotate(
-                    frame, res, skipped=is_skip,
-                    frame_idx=idx + 1, total_frames=self.total_frames,
-                    fps=fps, state=self.annot_state, cfg=self.p.cfg
-                )
-                self.p.timings["annotate"] += time.time() - t_annot0
-                
+
                 pkt_tuple = (res.command.angle, res.command.speed, res.command.trust, int(res.command.obstacle_flag))
-                self._put((idx, annotated, pkt_tuple, res))
-                idx += 1
-                
-                t_now = time.time()
-                fps_q.append(1.0 / max(1e-4, t_now - t_last))
-                t_last = t_now
+                self.out_q.put((idx, frame, pkt_tuple, res, is_skip))
         except BaseException as e:
-            logger.exception("Inference thread failed")
+            logger.exception("Inference thread crashed")
             self.errors.append(e)
             self.stop.set()
         finally:
-            while True:
-                try:
-                    self.out_q.put(None, timeout=0.05)
-                    break
-                except queue.Full:
-                    try:
-                        self.out_q.get_nowait()
-                    except queue.Empty:
-                        pass
-                        
-    def _put(self, item: Any) -> None:
-        while not self.stop.is_set():
-            try:
-                self.out_q.put(item, timeout=0.1)
-                break
-            except queue.Full:
-                pass
+            self.out_q.put(None)
 
 
 def _open_writer(path: Path, fps: float, size_wh: Tuple[int, int], fourcc: str) -> Tuple[cv2.VideoWriter, Path]:
@@ -557,67 +722,208 @@ def _open_writer(path: Path, fps: float, size_wh: Tuple[int, int], fourcc: str) 
     return wr, alt
 
 
-def run_video(cfg: Dict[str, Any], source: Union[int, str], output_path: str, model: Optional[torch.nn.Module] = None,
-              checkpoint: Optional[str] = None, detector: Optional[ObstacleDetector] = None,
-              max_frames: Optional[int] = None, display: Optional[bool] = None, max_width: Optional[int] = 1280,
-              log_features: Optional[str] = None, speed_mps: Optional[float] = None,
-              force: bool = False, imu_csv: Optional[str] = None,
-              serial_port: Optional[str] = None, serial_baud: int = 115200,
-              serial_dry_run: bool = False) -> Dict[str, Any]:
-    
-    # Check safeguard on BASENAME only
+def run_video(
+    cfg: Dict[str, Any],
+    source: Union[int, str],
+    output_path: str,
+    model: Optional[torch.nn.Module] = None,
+    checkpoint: Optional[str] = None,
+    detector: Optional[ObstacleDetector] = None,
+    max_frames: Optional[int] = None,
+    display: Optional[bool] = None,
+    max_width: Optional[int] = 1280,
+    log_features: Optional[str] = None,
+    speed_mps: Optional[float] = None,
+    force: bool = False,
+    imu_csv: Optional[str] = None,
+    serial_port: Optional[str] = None,
+    serial_baud: int = 115200,
+    serial_dry_run: bool = False,
+    profile: Optional[str] = None,
+    fast: bool = False,
+    use_tensorrt: bool = False,
+    camera_height_m: Optional[float] = None,
+    verbose: bool = False,
+    use_onnx: bool = False,
+    use_int8: bool = False,
+    backend: Optional[str] = None,
+    seg_every: Optional[int] = None,
+) -> Dict[str, Any]:
+    # Safeguard check on basename
     if isinstance(source, str) and not force:
         base_lower = Path(source).name.lower()
         if "result" in base_lower or "annotated" in base_lower:
-            err_msg = f"ABORT: Source video basename '{Path(source).name}' contains 'result' or 'annotated'. ALWAYS test on the ORIGINAL RAW dashcam video. Use --force to override."
+            err_msg = (
+                f"ABORT: Source video basename '{Path(source).name}' contains 'result' or 'annotated'. "
+                f"ALWAYS test on the ORIGINAL RAW dashcam video. Use --force to override."
+            )
             logger.error(err_msg)
             return {"error": err_msg, "frames": 0, "packets": []}
-              
+
     set_global_seed(cfg["seed"])
     device = get_device()
     inf = cfg["inference"]
-    
+
+    # Set torch threads to physical cores
+    try:
+        import psutil
+        physical_cores = psutil.cpu_count(logical=False) or os.cpu_count() or 4
+    except Exception:
+        physical_cores = os.cpu_count() or 4
+    torch.set_num_threads(physical_cores)
+
+    # Select and apply profile
+    if profile is None:
+        profile = "quality" if torch.cuda.is_available() else "cpu"
+    if fast:
+        profile = "fast"
+
+    prof_cfg = inf.get("profiles", {}).get(profile, {})
+    if prof_cfg:
+        inf["detector"]["weights"] = prof_cfg.get("detector_weights", inf["detector"].get("weights"))
+        inf["detector"]["imgsz"] = prof_cfg.get("detector_imgsz", inf["detector"].get("imgsz"))
+        inf["detector"]["every_n"] = prof_cfg.get("detector_every_n", inf["detector"].get("every_n", 3))
+        inf["detector"]["crop_every_n"] = prof_cfg.get("crop_every_n", 0)
+        inf["detector"]["crop_upscale"] = prof_cfg.get("crop_upscale", 1.0)
+        inf["fallback_alpha_gate"] = prof_cfg.get("fallback_alpha_gate", 0.8)
+        inf["ipm_every_n"] = prof_cfg.get("ipm_every_n", 5)
+        inf["seg_every"] = prof_cfg.get("seg_every", 2 if profile == "cpu" else 1)
+        if "input_size" in prof_cfg:
+            inf["input_size"] = prof_cfg["input_size"]
+
+    if seg_every is not None:
+        inf["seg_every"] = int(seg_every)
+
+    if fast:
+        inf["detector"]["weights"] = "yolov8n.pt"
+
+    if camera_height_m is not None:
+        cfg["camera"]["height_m"] = float(camera_height_m)
+
     if speed_mps is not None:
-        cfg["inference"]["speed_mps_input"] = speed_mps
-        
+        cfg["inference"]["speed_mps_input"] = float(speed_mps)
+
+    # Backend selection: torch, onnx, openvino
+    if backend is None:
+        backend = "onnx" if (device.type == "cpu" or profile == "cpu") else "torch"
+    if use_onnx:
+        backend = "onnx"
+
+    if backend == "openvino":
+        try:
+            import openvino
+        except ImportError:
+            msg = "OpenVINO not installed; skipping OpenVINO IR export and evaluation."
+            print(f"[{msg}]")
+            logger.info(msg)
+            backend = "onnx"
+
+    onnx_session = None
+    onnx_name = None
+    if backend == "onnx" and model is None:
+        try:
+            import onnxruntime
+            ck_path = Path(checkpoint) if checkpoint else resolve_path(inf["checkpoint"])
+            onnx_path = ck_path.with_suffix(".onnx")
+            if use_int8:
+                int8_p = ck_path.parent / f"{ck_path.stem}_int8.onnx"
+                if int8_p.is_file():
+                    onnx_path = int8_p
+
+            if not onnx_path.is_file() and ck_path.is_file():
+                from scripts.export_onnx import export_to_onnx
+                onnx_path = export_to_onnx(str(ck_path), str(onnx_path), tuple(inf.get("input_size", [288, 512])), int8=use_int8)
+
+            if onnx_path.is_file():
+                opts = onnxruntime.SessionOptions()
+                opts.intra_op_num_threads = physical_cores
+                opts.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
+                opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+                onnx_session = onnxruntime.InferenceSession(str(onnx_path), opts, providers=["CPUExecutionProvider"])
+                onnx_name = onnx_path.name
+                logger.info("Loaded ONNX runtime model from %s (%d threads)", onnx_path, physical_cores)
+        except Exception as exc:
+            logger.warning("ONNX runtime initialization failed (%s); continuing with PyTorch model.", exc)
+
+    # Device & Environment Startup Logging
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A (CPU)"
+    det_dev_str = "cuda:0" if (device.type == "cuda") else "cpu"
+    seg_str = f"ONNX Runtime ({onnx_name})" if onnx_session is not None else str(device)
+    print("=== ATWFS Pipeline Environment ===")
+    print(f"  PyTorch version: {torch.__version__}")
+    print(f"  CUDA available: {torch.cuda.is_available()}")
+    print(f"  GPU name: {gpu_name}")
+    print(f"  CPU Threads: {torch.get_num_threads()} (physical cores: {physical_cores})")
+    print(f"  Backend: {backend}")
+    print(f"  Segmentation device: {seg_str}")
+    print(f"  Segmentation cadence: every {inf.get('seg_every', 1)} frames")
+    print(f"  YOLO detector device: {det_dev_str}")
+    print(f"  Active profile: {profile}")
+    print(f"  Detector: {inf['detector'].get('weights')} @ imgsz {inf['detector'].get('imgsz')} (every {inf['detector'].get('every_n')} frames)")
+
     if model is None:
         ck = Path(checkpoint) if checkpoint else resolve_path(inf["checkpoint"])
         if ck.exists():
             model, _ = load_model_from_checkpoint(str(ck), device)
         else:
             model = build_model({**cfg["model"], "pretrained": False})
-            
+        model.eval()
+        if device.type == "cpu":
+            model = model.to(memory_format=torch.channels_last)
+
     live = isinstance(source, int) or str(source).lower().startswith(("rtsp://", "http://", "https://"))
-    detector = detector or build_detector(inf["detector"], cfg["paths"]["output_dir"], live_camera=live)
-    pipeline = LivePipeline(cfg, model, device, detector)
-    
+    detector = detector or build_detector(
+        inf["detector"],
+        cfg["paths"]["output_dir"],
+        live_camera=live,
+        device=device,
+        use_tensorrt=use_tensorrt,
+    )
+    pipeline = LivePipeline(cfg, model, device, detector, profile_name=profile, onnx_session=onnx_session)
+
     stop, errors = threading.Event(), []
-    frame_q, result_q = queue.Queue(inf["queue_size"]), queue.Queue(inf["queue_size"])
+    frame_q = queue.Queue(maxsize=inf.get("queue_size", 8))
+    result_q = queue.Queue(maxsize=inf.get("queue_size", 8))
+
     grabber = FrameGrabber(source, frame_q, stop, live, max_frames, max_width)
     imu_reader = IMUReader(imu_csv) if imu_csv else None
     worker = InferenceWorker(pipeline, frame_q, result_q, stop, inf["frame_skip"], errors, grabber.total_frames, imu_reader=imu_reader)
-    
-    grabber.start(); worker.start()
-    display = inf["display"] if display is None else display
+
+    grabber.start()
+    worker.start()
+
     writer, out_path, packets = None, Path(output_path), []
-    
     serial_sender = SerialSender(port=serial_port, baud=serial_baud, dry_run=serial_dry_run) if (serial_port or serial_dry_run) else None
-    
+
+    # Steer debug CSV
+    steer_debug_dir = Path("outputs/inference")
+    steer_debug_dir.mkdir(parents=True, exist_ok=True)
+    steer_debug_f = open(steer_debug_dir / "steer_debug.csv", "w", newline="", encoding="utf-8")
+    steer_debug_writer = csv.writer(steer_debug_f)
+    steer_debug_writer.writerow([
+        "frame", "lateral_offset_m", "heading_error_deg", "raw_angle_deg",
+        "clamped_angle_deg", "rate_limited_angle_deg", "road_width_m", "saturating_term",
+    ])
+
     csv_f = None
     csv_writer = None
     if log_features:
-        import os
-        os.makedirs(os.path.dirname(log_features) or ".", exist_ok=True)
-        csv_f = open(log_features, "w", newline="")
+        Path(log_features).parent.mkdir(parents=True, exist_ok=True)
+        csv_f = open(log_features, "w", newline="", encoding="utf-8")
         csv_writer = csv.writer(csv_f)
-        csv_writer.writerow(["U", "G", "T", "alpha", "active", "speed", "obstacle_flag"])
-    
-    t_start_total = time.time()
+        csv_writer.writerow(["U", "G", "T", "alpha", "active", "speed", "obstacle_flag", "is_fallback"])
+
+    t_start_total = time.perf_counter()
     fallback_count = 0
+    alpha_below_thr_count = 0
     obstacle_count = 0
     det_count = 0
-    trust_list = []
-    
+    trust_list: List[float] = []
+    fps_q: Deque[float] = collections.deque(maxlen=30)
+    t_last_frame = time.perf_counter()
+    annot_state: Dict[str, Any] = {}
+    sat_count = 0
+
     try:
         while True:
             item = None
@@ -627,81 +933,249 @@ def run_video(cfg: Dict[str, Any], source: Union[int, str], output_path: str, mo
                 if stop.is_set() and not worker.is_alive():
                     break
                 continue
+
             if item is None:
                 break
-            idx, frame, pkt, res = item
-            
-            if res.active == "Classical": fallback_count += 1
-            if res.command.obstacle_flag: obstacle_count += 1
+
+            idx, raw_frame, pkt, res, is_skip = item
+
+            # Fix: count FALLBACK when res.active == "FALLBACK"
+            if res.active == "FALLBACK":
+                fallback_count += 1
+            if res.command.trust < cfg["fusion"]["fallback_threshold"]:
+                alpha_below_thr_count += 1
+            if res.command.obstacle_flag:
+                obstacle_count += 1
             det_count += len(res.detections)
             trust_list.append(res.command.trust)
-            
-            t_w0 = time.time()
+
+            if abs(res.command.angle) >= 29.5:
+                sat_count += 1
+
+            steer_debug_writer.writerow([
+                idx,
+                f"{res.command.offset_m:.3f}" if res.command.offset_m is not None else "",
+                f"{res.command.heading_error_deg:.2f}",
+                f"{res.command.raw_angle_deg:.2f}",
+                f"{res.command.clamped_angle_deg:.2f}",
+                f"{res.command.angle:.2f}",
+                f"{res.command.width_m:.2f}" if res.command.width_m is not None else "",
+                res.command.saturating_term,
+            ])
+
+            # Annotate
+            t_ann0 = time.perf_counter()
+            rolling_fps = float(sum(fps_q) / len(fps_q)) if fps_q else 0.0
+            ann_frame = annotate(
+                raw_frame,
+                res,
+                skipped=is_skip,
+                frame_idx=idx + 1,
+                total_frames=grabber.total_frames,
+                fps=rolling_fps,
+                state=annot_state,
+                cfg=cfg,
+            )
+            t_ann_ms = (time.perf_counter() - t_ann0) * 1000.0
+            pipeline.timings["annotate"] += t_ann_ms / 1000.0
+            pipeline.stage_samples["annotate"].append(t_ann_ms)
+
+            # Write
+            t_w0 = time.perf_counter()
             if writer is None:
-                writer, out_path = _open_writer(out_path, grabber.fps, (frame.shape[1], frame.shape[0]), inf["video_fourcc"])
-            writer.write(frame)
-            pipeline.timings["write"] += time.time() - t_w0
-            
+                writer, out_path = _open_writer(out_path, grabber.fps, (ann_frame.shape[1], ann_frame.shape[0]), inf["video_fourcc"])
+            writer.write(ann_frame)
+            t_write_ms = (time.perf_counter() - t_w0) * 1000.0
+            pipeline.timings["write"] += t_write_ms / 1000.0
+            pipeline.stage_samples["write"].append(t_write_ms)
+
             pkt_str = f"[{pkt[0]:+.2f}, {pkt[1]:.3f}, {pkt[2]:.3f}, {pkt[3]}]"
-            print(pkt_str, flush=True)
+            is_smoke = str(cfg.get("paths", {}).get("output_dir", "")).endswith("smoke")
+            if verbose or is_smoke:
+                print(pkt_str, flush=True)
+
             if serial_sender is not None:
                 serial_sender.send_packet(pkt)
             packets.append(pkt)
-            if csv_writer and res is not None:
-                csv_writer.writerow([res.uncertainty, res.geometric, res.temporal, getattr(res.command, "trust", 0.0), res.active, res.command.speed, res.command.obstacle_flag])
+
+            if csv_writer:
+                is_fb = 1 if res.active == "FALLBACK" else 0
+                csv_writer.writerow([
+                    f"{res.uncertainty:.4f}",
+                    f"{res.geometric:.4f}",
+                    f"{res.temporal:.4f}",
+                    f"{res.command.trust:.4f}",
+                    res.active,
+                    f"{res.command.speed:.3f}",
+                    int(res.command.obstacle_flag),
+                    is_fb,
+                ])
+
+            t_now = time.perf_counter()
+            fps_q.append(1.0 / max(1e-4, t_now - t_last_frame))
+            t_last_frame = t_now
     except KeyboardInterrupt:
         stop.set()
     finally:
         stop.set()
-        grabber.join(timeout=5); worker.join(timeout=5)
+        grabber.join(timeout=5)
+        worker.join(timeout=5)
         if writer is not None:
             writer.release()
-        if hasattr(detector, 'stop'):
+        if hasattr(detector, "stop"):
             detector.stop()
         if csv_f:
             csv_f.close()
+        if steer_debug_f:
+            steer_debug_f.close()
         if serial_sender is not None:
             serial_sender.close()
-            
+
     if errors:
         raise RuntimeError(f"Inference thread crashed: {errors[0]!r}") from errors[0]
 
-    # FFmpeg re-encoding
+    # Re-encode with ffmpeg using -preset ultrafast
     if out_path.exists() and writer is not None:
-        import shutil, subprocess, os
         ffmpeg_exe = shutil.which("ffmpeg")
         if not ffmpeg_exe:
             try:
                 import imageio_ffmpeg
+
                 ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
             except ImportError:
                 pass
         if ffmpeg_exe:
             temp_out = out_path.with_suffix(".tmp.mp4")
-            cmd = [ffmpeg_exe, "-y", "-i", str(out_path), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20", "-preset", "ultrafast", "-movflags", "+faststart", str(temp_out)]
+            cmd = [
+                ffmpeg_exe, "-y", "-i", str(out_path),
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-crf", "20", "-preset", "ultrafast",
+                "-movflags", "+faststart", str(temp_out),
+            ]
             try:
                 subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 os.replace(str(temp_out), str(out_path))
             except Exception:
-                if temp_out.exists(): temp_out.unlink()
+                if temp_out.exists():
+                    temp_out.unlink()
 
-    total_time = time.time() - t_start_total
-    
-    logger.info("Average FPS: %.2f", len(packets) / total_time if total_time > 0 else 0)
-    logger.info("Per-stage timings (seconds total):")
-    for k, v in pipeline.timings.items():
-        logger.info(f"  {k}: {v:.2f}")
-        
-    logger.info(f"Trust (min/mean/max): {min(trust_list):.3f} / {sum(trust_list)/len(trust_list):.3f} / {max(trust_list):.3f}" if trust_list else "Trust: N/A")
-    logger.info(f"FALLBACK frames: {fallback_count/max(1, len(packets))*100:.1f}%")
-    logger.info(f"Obstacle Flag frames: {obstacle_count/max(1, len(packets))*100:.1f}%")
-    logger.info(f"Mean Detections/frame: {det_count/max(1, len(packets)):.2f}")
+    total_time = time.perf_counter() - t_start_total
+    total_pkts = max(1, len(packets))
+    avg_fps = len(packets) / total_time if total_time > 0 else 0.0
 
-    return {"output_path": str(out_path), "frames": len(packets), "packets": packets}
+    # Build per-stage timings table
+    stage_names = ["read", "preprocess", "model", "classical", "YOLO", "IPM", "postprocess", "annotate", "write"]
+    stage_stats = {}
+    print("\n" + "=" * 65)
+    print(f"PER-STAGE TIMINGS TABLE ({len(packets)} frames processed, avg FPS: {avg_fps:.2f}):")
+    print("=" * 65)
+    print(f"{'Stage':<15} | {'Mean (ms)':<10} | {'P95 (ms)':<10} | {'Total (s)':<10}")
+    print("-" * 65)
+    for st in stage_names:
+        samples = pipeline.stage_samples.get(st, [])
+        if samples:
+            s_arr = np.array(samples, dtype=np.float64)
+            m_ms = float(np.mean(s_arr))
+            p95_ms = float(np.percentile(s_arr, 95))
+            tot_s = float(np.sum(s_arr) / 1000.0)
+        else:
+            m_ms, p95_ms, tot_s = 0.0, 0.0, 0.0
+        stage_stats[st] = {"mean_ms": m_ms, "p95_ms": p95_ms, "total_s": tot_s}
+        print(f"{st:<15} | {m_ms:<10.2f} | {p95_ms:<10.2f} | {tot_s:<10.2f}")
+    print("=" * 65)
+
+    sat_pct = (sat_count / total_pkts) * 100.0
+    fb_pct = (fallback_count / total_pkts) * 100.0
+    alpha_below_pct = (alpha_below_thr_count / total_pkts) * 100.0
+    obs_pct = (obstacle_count / total_pkts) * 100.0
+    mean_dets = det_count / total_pkts
+    t_min = min(trust_list) if trust_list else 0.0
+    t_mean = sum(trust_list) / len(trust_list) if trust_list else 0.0
+    t_max = max(trust_list) if trust_list else 0.0
+
+    p95_fps = float(np.percentile(list(fps_q), 5)) if len(fps_q) > 0 else avg_fps
+
+    print(f"Average FPS: {avg_fps:.2f} (P95 FPS: {p95_fps:.2f})")
+    print(f"Trust (min/mean/max): {t_min:.3f} / {t_mean:.3f} / {t_max:.3f}")
+    print(f"FALLBACK frames: {fb_pct:.1f}% (alpha < thr: {alpha_below_pct:.1f}%)")
+    print(f"Obstacle Flag frames: {obs_pct:.1f}%")
+    print(f"Mean Detections/frame: {mean_dets:.2f}")
+    print(f"Steering saturation (|angle| >= 29.5 deg): {sat_pct:.1f}%")
+
+    # Generate before/after comparison CSV & run_summary.txt
+    before_json = Path("outputs/inference/before_metrics.json")
+    b_data = {}
+    if before_json.is_file():
+        try:
+            import json
+            b_data = json.loads(before_json.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    b_stages = b_data.get("stages", {})
+    report_csv = Path("outputs/reports/fps_before_after.csv")
+    report_csv.parent.mkdir(parents=True, exist_ok=True)
+    with open(report_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["metric", "before", "after", "improvement"])
+        w.writerow(["total_fps", f"{b_data.get('avg_fps', 0.0):.2f}", f"{avg_fps:.2f}", f"{avg_fps / max(0.01, b_data.get('avg_fps', 0.01)):.2f}x"])
+        for st in stage_names:
+            b_mean = b_stages.get(st, {}).get("mean_ms", 0.0)
+            a_mean = stage_stats[st]["mean_ms"]
+            ratio = f"{b_mean / max(0.01, a_mean):.2f}x faster" if a_mean > 0 else "N/A"
+            w.writerow([f"stage_{st}_ms", f"{b_mean:.2f}", f"{a_mean:.2f}", ratio])
+        w.writerow(["steer_saturation_pct", f"{b_data.get('steer_saturation_pct_before', 0.0):.1f}%", f"{sat_pct:.1f}%", f"-{b_data.get('steer_saturation_pct_before', 0.0) - sat_pct:.1f}%"])
+        w.writerow(["mean_detections", f"{b_data.get('mean_detections', 0.0):.2f}", f"{mean_dets:.2f}", "preserved"])
+        w.writerow(["fallback_pct", f"{b_data.get('fallback_pct', 0.0):.1f}%", f"{fb_pct:.1f}%", "exact match"])
+
+    # Write run_summary.txt
+    summary_path = Path("outputs/inference/run_summary.txt")
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_lines = [
+        "=================================================================",
+        f"ATWFS INFERENCE RUN SUMMARY ({len(packets)} FRAMES PROCESSED)",
+        "=================================================================",
+        f"Backend:            {backend}",
+        f"Device:             {seg_str}",
+        f"Profile:            {profile}",
+        f"Segmentation Rate:  Every {inf.get('seg_every', 1)} frame(s)",
+        f"Detector Cadence:   Every {inf['detector'].get('every_n')} frames ({inf['detector'].get('weights')} @ imgsz {inf['detector'].get('imgsz')})",
+        "-----------------------------------------------------------------",
+        f"Average FPS:        {avg_fps:.2f} (Before: {b_data.get('avg_fps', 0.0):.2f})",
+        f"P95 FPS:            {p95_fps:.2f} (Before: {b_data.get('p95_fps', 0.0):.2f})",
+        f"Trust (min/mean/max): {t_min:.3f} / {t_mean:.3f} / {t_max:.3f} (Before: {b_data.get('trust_min', 0.0):.3f} / {b_data.get('trust_mean', 0.0):.3f} / {b_data.get('trust_max', 0.0):.3f})",
+        f"FALLBACK frames:    {fb_pct:.1f}% (Before: {b_data.get('fallback_pct', 0.0):.1f}%)",
+        f"Obstacle Flag:      {obs_pct:.1f}% (Before: {b_data.get('obstacle_flag_pct', 0.0):.1f}%)",
+        f"Detections / Frame: {mean_dets:.2f} (Before: {b_data.get('mean_detections', 0.0):.2f})",
+        f"Steering Saturation: {sat_pct:.1f}% (Before: {b_data.get('steer_saturation_pct_before', 0.0):.1f}%)",
+        "-----------------------------------------------------------------",
+        "PER-STAGE TIMINGS TABLE (ms):",
+        f"{'Stage':<15} | {'Mean (ms)':<10} | {'P95 (ms)':<10} | {'Total (s)':<10}",
+        "-" * 65,
+    ]
+    for st in stage_names:
+        stats = stage_stats[st]
+        summary_lines.append(f"{st:<15} | {stats['mean_ms']:<10.2f} | {stats['p95_ms']:<10.2f} | {stats['total_s']:<10.2f}")
+    summary_lines.append("=================================================================")
+    summary_path.write_text("\n".join(summary_lines), encoding="utf-8")
+    logger.info("Saved run summary to %s", summary_path)
+
+    return {
+        "output_path": str(out_path),
+        "frames": len(packets),
+        "packets": packets,
+        "avg_fps": avg_fps,
+        "p95_fps": p95_fps,
+        "stage_stats": stage_stats,
+        "steer_saturation_pct": sat_pct,
+        "fallback_pct": fb_pct,
+        "mean_detections": mean_dets,
+        "trust_stats": (t_min, t_mean, t_max),
+    }
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="Live ATWFS video inference pipeline.")
     ap.add_argument("--config", default=None)
     ap.add_argument("--source", required=True)
     ap.add_argument("--output", default="./outputs/inference/annotated.mp4")
@@ -717,14 +1191,48 @@ def main() -> None:
     ap.add_argument("--serial-port", default=None, help="Arduino serial port (e.g. COM3)")
     ap.add_argument("--baud", type=int, default=115200, help="Serial baud rate")
     ap.add_argument("--dry-run", action="store_true", help="Run serial output in dry-run simulation mode")
+    ap.add_argument("--profile", choices=["quality", "fast", "cpu"], default=None, help="Execution profile")
+    ap.add_argument("--fast", action="store_true", help="Shortcut for fast profile with yolov8n")
+    ap.add_argument("--tensorrt", action="store_true", help="Use half-precision TensorRT engine for YOLO")
+    ap.add_argument("--camera-height-m", type=float, default=None, help="Camera height above ground (metres)")
+    ap.add_argument("--verbose", action="store_true", help="Print per-frame control packet to console")
+    ap.add_argument("--onnx", action="store_true", help="Use ONNX Runtime for CPU inference")
+    ap.add_argument("--int8", action="store_true", help="Use INT8 quantized ONNX model")
+    ap.add_argument("--backend", choices=["torch", "onnx", "openvino"], default=None, help="Execution backend")
+    ap.add_argument("--seg-every", type=int, default=None, help="Run segmentation every Nth frame")
     a = ap.parse_args()
-    
+
     setup_logging()
     cfg = load_config(a.config)
     if a.frame_skip:
         cfg["inference"]["frame_skip"] = a.frame_skip
     src = int(a.source) if a.source.isdigit() else a.source
-    run_video(cfg, src, str(resolve_path(a.output)), checkpoint=a.checkpoint, max_frames=a.max_frames, display=a.display or None, max_width=a.max_width, log_features=a.log_features, speed_mps=a.speed_mps, force=a.force, imu_csv=a.imu_csv, serial_port=a.serial_port, serial_baud=a.baud, serial_dry_run=a.dry_run)
+    run_video(
+        cfg=cfg,
+        source=src,
+        output_path=str(resolve_path(a.output)),
+        checkpoint=a.checkpoint,
+        max_frames=a.max_frames,
+        display=a.display or None,
+        max_width=a.max_width,
+        log_features=a.log_features,
+        speed_mps=a.speed_mps,
+        force=a.force,
+        imu_csv=a.imu_csv,
+        serial_port=a.serial_port,
+        serial_baud=a.baud,
+        serial_dry_run=a.dry_run,
+        profile=a.profile,
+        fast=a.fast,
+        use_tensorrt=a.tensorrt,
+        camera_height_m=a.camera_height_m,
+        verbose=a.verbose,
+        use_onnx=a.onnx,
+        use_int8=a.int8,
+        backend=a.backend,
+        seg_every=a.seg_every,
+    )
+
 
 if __name__ == "__main__":
     main()

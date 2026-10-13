@@ -1,0 +1,30 @@
+=================================================================
+ATWFS INFERENCE RUN SUMMARY (300 FRAMES PROCESSED)
+=================================================================
+Backend:            onnx
+Device:             ONNX Runtime (student_best.onnx)
+Profile:            cpu
+Segmentation Rate:  Every 1 frame(s)
+Detector Cadence:   Every 4 frames (yolov8n.pt @ imgsz 640)
+-----------------------------------------------------------------
+Average FPS:        10.22 (Before: 1.64)
+P95 FPS:            4.78 (Before: 1.49)
+Trust (min/mean/max): 0.069 / 0.619 / 0.924 (Before: 0.279 / 0.760 / 0.921)
+FALLBACK frames:    16.7% (Before: 3.3%)
+Obstacle Flag:      32.0% (Before: 50.0%)
+Detections / Frame: 2.47 (Before: 2.92)
+Steering Saturation: 0.0% (Before: 51.7%)
+-----------------------------------------------------------------
+PER-STAGE TIMINGS TABLE (ms):
+Stage           | Mean (ms)  | P95 (ms)   | Total (s) 
+-----------------------------------------------------------------
+read            | 1.76       | 2.27       | 0.53      
+preprocess      | 9.79       | 12.53      | 2.94      
+model           | 44.68      | 55.50      | 13.41     
+classical       | 6.27       | 16.93      | 1.88      
+YOLO            | 28.95      | 134.97     | 8.68      
+IPM             | 1.76       | 1.97       | 0.53      
+postprocess     | 2.57       | 3.17       | 0.77      
+annotate        | 7.20       | 10.96      | 2.16      
+write           | 5.05       | 7.41       | 1.51      
+=================================================================

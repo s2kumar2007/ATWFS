@@ -277,6 +277,42 @@ inference:
     - 17
     - 18
     - 19
+  profiles:
+    quality:
+      detector_weights: yolov8s.pt
+      detector_imgsz: 960
+      detector_every_n: 3
+      crop_every_n: 6
+      crop_upscale: 2.0
+      fallback_alpha_gate: 0.8
+      ipm_every_n: 5
+      input_size:
+      - 288
+      - 512
+    fast:
+      detector_weights: yolov8s.pt
+      detector_imgsz: 640
+      detector_every_n: 3
+      crop_every_n: 0
+      crop_upscale: 1.0
+      fallback_alpha_gate: 0.8
+      ipm_every_n: 5
+      input_size:
+      - 288
+      - 512
+    cpu:
+      detector_weights: yolov8n.pt
+      detector_imgsz: 640
+      detector_every_n: 4
+      crop_every_n: 0
+      crop_upscale: 1.0
+      fallback_alpha_gate: 0.5
+      ipm_every_n: 10
+      seg_every: 1
+      backend: onnx
+      input_size:
+      - 288
+      - 512
   decision:
     max_steer_deg: 30.0
     v_max: 1.5
@@ -285,6 +321,12 @@ inference:
     lookahead_rows:
     - 0.55
     - 0.9
+    lookahead_m: 6.0
+    wheelbase_m: 2.5
+    steer_ema_alpha: 0.4
+    max_steer_rate_deg: 5.0
+    max_ego_lane_width_m: 4.0
+    ego_window_half_m: 1.8
     prox_slow: 0.55
     prox_stop: 0.85
     corridor_half_width: 0.2
