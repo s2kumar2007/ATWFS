@@ -19,6 +19,8 @@ from inference.consistency import geometric_score, temporal_score
 from inference.decision import Command, compute_command, subtract_obstacles
 from inference.detector import Detection, ObstacleDetector, build_detector
 from inference.fusion import ATWFS
+from inference.ipm import IMUReader, InversePerspectiveMapping, IPMResult
+from inference.serial_out import SerialSender
 from models.unet_mobilenet import build_model, evidential_uncertainty
 from training.train import load_model_from_checkpoint
 from utils.config import load_config, resolve_path
@@ -38,6 +40,8 @@ class FrameResult:
     temporal: float
     terrain: int
     detections: List[Detection]
+    ipm: Optional[IPMResult] = None
+    mode: str = "day"
 
 
 class LivePipeline:
@@ -46,7 +50,7 @@ class LivePipeline:
         self.cfg = cfg
         self.device = device
         self.model = model.to(device).eval()
-        if torch.cuda.is_available():
+        if self.device.type == "cuda":
             self.model = self.model.half()
             
         self.detector = detector
@@ -66,9 +70,22 @@ class LivePipeline:
         # Hood polygon setup
         self.hood_poly_norm = np.array(cfg["inference"].get("hood_polygon", [[0.0, 1.0], [0.1, 0.75], [0.9, 0.75], [1.0, 1.0]]))
         self.hood_poly_model = None
+        self.ipm = InversePerspectiveMapping(cfg)
+        
+        # Night mode state & hysteresis debounce
+        night_cfg = cfg["inference"].get("night_mode", {})
+        self.night_mode_enabled = bool(night_cfg.get("enabled", True))
+        self.night_thresh_low = float(night_cfg.get("threshold_low", 45.0))
+        self.night_thresh_high = float(night_cfg.get("threshold_high", 60.0))
+        self.night_debounce_frames = int(night_cfg.get("debounce_frames", 10))
+        self.current_mode = "day"
+        self.night_debounce_counter = 0
+        if hasattr(self.model, "add_night_decoder"):
+            self.model.add_night_decoder()
 
     @torch.inference_mode()
-    def process_frame(self, frame_bgr: np.ndarray, speed_mps: Optional[float] = None, frame_idx: int = 0) -> FrameResult:
+    def process_frame(self, frame_bgr: np.ndarray, speed_mps: Optional[float] = None, frame_idx: int = 0,
+                      imu_sample: Optional[Dict[str, float]] = None, dt: float = 0.04) -> FrameResult:
         cfg = self.cfg
         speed = cfg["inference"]["speed_mps_input"] if speed_mps is None else speed_mps
         fh, fw = frame_bgr.shape[:2]
@@ -104,10 +121,40 @@ class LivePipeline:
                 
         cv2.fillPoly(padded, [self.hood_poly_model], road_color)
         
+        # Low-light / night mode detection via road region mean luminance
+        if self.night_mode_enabled:
+            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            if self.prev_dl_mask is not None and np.count_nonzero(self.prev_dl_mask) > 50:
+                m_resized = cv2.resize(self.prev_dl_mask, (fw, fh), interpolation=cv2.INTER_NEAREST)
+                road_luma = float(np.mean(gray[m_resized > 0]))
+            else:
+                road_luma = float(np.mean(gray[int(fh * 0.50):int(fh * 0.70), int(fw * 0.30):int(fw * 0.70)]))
+            
+            # Hysteresis + 10-frame debounce
+            if self.current_mode == "day":
+                if road_luma < self.night_thresh_low:
+                    self.night_debounce_counter += 1
+                    if self.night_debounce_counter >= self.night_debounce_frames:
+                        self.current_mode = "night"
+                        self.night_debounce_counter = 0
+                else:
+                    self.night_debounce_counter = 0
+            else:
+                if road_luma > self.night_thresh_high:
+                    self.night_debounce_counter += 1
+                    if self.night_debounce_counter >= self.night_debounce_frames:
+                        self.current_mode = "day"
+                        self.night_debounce_counter = 0
+                else:
+                    self.night_debounce_counter = 0
+            
+            if hasattr(self.model, "set_mode"):
+                self.model.set_mode(self.current_mode)
+
         t0 = time.time()
         x = (cv2.cvtColor(padded, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0 - self.mean) / self.std
         x_tensor = torch.from_numpy(x.transpose(2, 0, 1)).unsqueeze(0).to(self.device)
-        if torch.cuda.is_available():
+        if self.device.type == "cuda":
             x_tensor = x_tensor.half()
         self.timings["preprocess"] += time.time() - t0
         
@@ -188,7 +235,7 @@ class LivePipeline:
         self.timings["postprocess"] += time.time() - t0
 
         t0 = time.time()
-        print('detecting...'); dets = self.detector.detect(frame_bgr, frame_idx); print('detected!')
+        dets = self.detector.detect(frame_bgr, frame_idx)
         
         # Ignore detections inside hood
         hp_fw_fh = np.zeros_like(self.hood_poly_norm, dtype=np.int32)
@@ -205,12 +252,22 @@ class LivePipeline:
         mask = cv2.resize(mask, (fw, fh), interpolation=cv2.INTER_NEAREST)
         raw_mask = mask.copy()
         
+        # Self-calibrating IPM (bird's-eye view)
+        t_ipm0 = time.time()
+        ipm_res = self.ipm.process_frame(frame_bgr, mask, dt=dt, imu_sample=imu_sample)
+        self.timings["ipm"] += time.time() - t_ipm0
+
         # Create hood map for decision logic (don't compute path in hood)
         # Decision.py logic already takes topmost mask, which is 0 in hood area.
         mask = subtract_obstacles(mask, dets, cfg["inference"]["decision"]["obstacle_dilate_px"])
-        cmd = compute_command(mask, dets, fused.alpha, terrain, cfg["inference"]["decision"], raw_mask=raw_mask)
+        cmd = compute_command(
+            mask, dets, fused.alpha, terrain, cfg["inference"]["decision"],
+            raw_mask=raw_mask,
+            road_width_m=ipm_res.road_width_m,
+            lateral_offset_m=ipm_res.lateral_offset_m
+        )
         
-        return FrameResult(mask, cmd, fused.active, unc, geo, tmp, terrain, dets)
+        return FrameResult(mask, cmd, fused.active, unc, geo, tmp, terrain, dets, ipm=ipm_res, mode=self.current_mode)
 
 def is_overlap(r1, r2):
     return not (r1[0] >= r2[2] or r1[2] <= r2[0] or r1[1] >= r2[3] or r1[3] <= r2[1])
@@ -319,10 +376,12 @@ def annotate(frame_bgr: np.ndarray, res: FrameResult, skipped: bool = False,
         lbl_x, lbl_y = d.x1, d.y1 - 5
         rect = [lbl_x, lbl_y - th - 3, lbl_x + tw, lbl_y + 3]
         
-        # HUD area (top left 400x250 approx)
+        # HUD area (top left 350x250 approx)
         hud_rect = [0, 0, int(350 * s), int(250 * s)]
         
-        while any(is_overlap(rect, pr) for pr in placed_rects) or is_overlap(rect, hud_rect):
+        attempts = 0
+        while (any(is_overlap(rect, pr) for pr in placed_rects) or is_overlap(rect, hud_rect)) and attempts < 10:
+            attempts += 1
             # Move up
             rect[1] -= th + 5
             rect[3] -= th + 5
@@ -331,11 +390,12 @@ def annotate(frame_bgr: np.ndarray, res: FrameResult, skipped: bool = False,
                 # Move below
                 lbl_y = d.y2 + th + 5
                 rect = [lbl_x, lbl_y - th - 3, lbl_x + tw, lbl_y + 3]
-                if any(is_overlap(rect, pr) for pr in placed_rects):
+                if any(is_overlap(rect, pr) for pr in placed_rects) or is_overlap(rect, hud_rect):
                     # Move right
-                    rect[0] += 50
-                    rect[2] += 50
-                    lbl_x += 50
+                    shift_dx = max(30, int(tw + 10))
+                    rect[0] += shift_dx
+                    rect[2] += shift_dx
+                    lbl_x += shift_dx
         
         placed_rects.append(rect)
         cv2.rectangle(out, (rect[0], rect[1]), (rect[2], rect[3]), (0, 0, 0), -1)
@@ -345,14 +405,18 @@ def annotate(frame_bgr: np.ndarray, res: FrameResult, skipped: bool = False,
     ang = res.command.angle
     curve = "STRAIGHT" if abs(ang) < 5 else ("RIGHT SHARP" if ang > 15 else ("RIGHT" if ang > 5 else ("LEFT SHARP" if ang < -15 else "LEFT")))
     
+    width_text = f"ROAD WIDTH: {res.command.width_m:.2f} m" if res.command.width_m is not None else f"ROAD WIDTH: {res.command.width_frac * 100.0:.1f}%"
+    
     lines = [
         f"ATWFS DRIVABLE REGION | FRAME: {frames_str} | {fps:.1f} FPS",
-        f"ESTIMATOR: {res.active}   TRUST: {res.command.trust:.2f}",
+        f"ESTIMATOR: {res.active}   TRUST: {res.command.trust:.2f}   MODE: {res.mode.upper()}",
         f"STEER: {ang:+.1f} deg {curve}   SPEED: {res.command.speed:.2f} m/s",
         f"OBSTACLE: {'YES' if res.command.obstacle_flag else 'NO'}",
-        f"ROAD WIDTH: {res.command.width_frac * 100.0:.1f}%",
-        "LEGEND: Blu=Drivable Yel=Path Cy=Veh Org=App/In-corr Red=Obs"
+        width_text,
     ]
+    if res.ipm and res.ipm.valid:
+        lines.append(f"IPM: {res.ipm.method.upper()} (P:{res.ipm.pitch_deg:+.1f} deg R:{res.ipm.roll_deg:+.1f} deg)")
+    lines.append("LEGEND: Blu=Drivable Yel=Path Cy=Veh Org=App/In-corr Red=Obs")
     
     y = int(25 * s)
     for line in lines:
@@ -377,12 +441,6 @@ class FrameGrabber(threading.Thread):
         self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 25.0
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not live else None
         self.max_width = max_width
-        
-        # Read first frame resolution
-        ret, frame = self.cap.read()
-        if ret:
-            print(f"First-frame resolution: {frame.shape[1]}x{frame.shape[0]}")
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # reset
 
     def run(self) -> None:
         count = 0
@@ -390,6 +448,8 @@ class FrameGrabber(threading.Thread):
             ret, frame = self.cap.read()
             if not ret:
                 break
+            if count == 0:
+                print(f"First-frame resolution: {frame.shape[1]}x{frame.shape[0]}")
             
             if self.max_width and frame.shape[1] > self.max_width:
                 scale = self.max_width / frame.shape[1]
@@ -412,12 +472,14 @@ class FrameGrabber(threading.Thread):
 
 class InferenceWorker(threading.Thread):
     def __init__(self, pipeline: LivePipeline, in_q: "queue.Queue", out_q: "queue.Queue",
-                 stop: threading.Event, skip: int, errors: List[BaseException], total_frames: Optional[int]) -> None:
+                 stop: threading.Event, skip: int, errors: List[BaseException], total_frames: Optional[int],
+                 imu_reader: Optional[IMUReader] = None) -> None:
         super().__init__()
         self.p, self.in_q, self.out_q, self.stop, self.skip = pipeline, in_q, out_q, stop, max(1, skip)
         self.errors = errors
         self.annot_state: Dict[str, Any] = {}
         self.total_frames = total_frames
+        self.imu_reader = imu_reader
 
     def run(self) -> None:
         idx, last_frame, last_res, last_annot = 0, None, None, None
@@ -436,7 +498,8 @@ class InferenceWorker(threading.Thread):
                 t_start = time.time()
                 is_skip = (idx % self.skip != 0)
                 if not is_skip or last_res is None:
-                    res = self.p.process_frame(frame, frame_idx=idx)
+                    imu_sample = self.imu_reader.get_sample(idx) if self.imu_reader else None
+                    res = self.p.process_frame(frame, frame_idx=idx, imu_sample=imu_sample)
                     last_res = res
                 else:
                     res = last_res
@@ -450,7 +513,8 @@ class InferenceWorker(threading.Thread):
                 )
                 self.p.timings["annotate"] += time.time() - t_annot0
                 
-                self._put((idx, annotated, res.command.packet, res))
+                pkt_tuple = (res.command.angle, res.command.speed, res.command.trust, int(res.command.obstacle_flag))
+                self._put((idx, annotated, pkt_tuple, res))
                 idx += 1
                 
                 t_now = time.time()
@@ -496,14 +560,18 @@ def _open_writer(path: Path, fps: float, size_wh: Tuple[int, int], fourcc: str) 
 def run_video(cfg: Dict[str, Any], source: Union[int, str], output_path: str, model: Optional[torch.nn.Module] = None,
               checkpoint: Optional[str] = None, detector: Optional[ObstacleDetector] = None,
               max_frames: Optional[int] = None, display: Optional[bool] = None, max_width: Optional[int] = 1280,
-              log_features: Optional[str] = None, speed_mps: Optional[float] = None) -> Dict[str, Any]:
+              log_features: Optional[str] = None, speed_mps: Optional[float] = None,
+              force: bool = False, imu_csv: Optional[str] = None,
+              serial_port: Optional[str] = None, serial_baud: int = 115200,
+              serial_dry_run: bool = False) -> Dict[str, Any]:
     
-    # Check safeguard
-    if isinstance(source, str):
-        src_lower = source.lower()
-        if "result" in src_lower or "annotated" in src_lower or "new" in src_lower:
-            print(f"ABORT: Detected a processed video filename '{source}'. ALWAYS test on the ORIGINAL RAW dashcam video.")
-            return {}
+    # Check safeguard on BASENAME only
+    if isinstance(source, str) and not force:
+        base_lower = Path(source).name.lower()
+        if "result" in base_lower or "annotated" in base_lower:
+            err_msg = f"ABORT: Source video basename '{Path(source).name}' contains 'result' or 'annotated'. ALWAYS test on the ORIGINAL RAW dashcam video. Use --force to override."
+            logger.error(err_msg)
+            return {"error": err_msg, "frames": 0, "packets": []}
               
     set_global_seed(cfg["seed"])
     device = get_device()
@@ -526,11 +594,14 @@ def run_video(cfg: Dict[str, Any], source: Union[int, str], output_path: str, mo
     stop, errors = threading.Event(), []
     frame_q, result_q = queue.Queue(inf["queue_size"]), queue.Queue(inf["queue_size"])
     grabber = FrameGrabber(source, frame_q, stop, live, max_frames, max_width)
-    worker = InferenceWorker(pipeline, frame_q, result_q, stop, inf["frame_skip"], errors, grabber.total_frames)
+    imu_reader = IMUReader(imu_csv) if imu_csv else None
+    worker = InferenceWorker(pipeline, frame_q, result_q, stop, inf["frame_skip"], errors, grabber.total_frames, imu_reader=imu_reader)
     
     grabber.start(); worker.start()
     display = inf["display"] if display is None else display
     writer, out_path, packets = None, Path(output_path), []
+    
+    serial_sender = SerialSender(port=serial_port, baud=serial_baud, dry_run=serial_dry_run) if (serial_port or serial_dry_run) else None
     
     csv_f = None
     csv_writer = None
@@ -551,7 +622,7 @@ def run_video(cfg: Dict[str, Any], source: Union[int, str], output_path: str, mo
         while True:
             item = None
             try:
-                print('getting...'); item = result_q.get(timeout=0.1); print('got!')
+                item = result_q.get(timeout=0.1)
             except queue.Empty:
                 if stop.is_set() and not worker.is_alive():
                     break
@@ -571,7 +642,10 @@ def run_video(cfg: Dict[str, Any], source: Union[int, str], output_path: str, mo
             writer.write(frame)
             pipeline.timings["write"] += time.time() - t_w0
             
-            print(pkt)
+            pkt_str = f"[{pkt[0]:+.2f}, {pkt[1]:.3f}, {pkt[2]:.3f}, {pkt[3]}]"
+            print(pkt_str, flush=True)
+            if serial_sender is not None:
+                serial_sender.send_packet(pkt)
             packets.append(pkt)
             if csv_writer and res is not None:
                 csv_writer.writerow([res.uncertainty, res.geometric, res.temporal, getattr(res.command, "trust", 0.0), res.active, res.command.speed, res.command.obstacle_flag])
@@ -586,6 +660,8 @@ def run_video(cfg: Dict[str, Any], source: Union[int, str], output_path: str, mo
             detector.stop()
         if csv_f:
             csv_f.close()
+        if serial_sender is not None:
+            serial_sender.close()
             
     if errors:
         raise RuntimeError(f"Inference thread crashed: {errors[0]!r}") from errors[0]
@@ -636,6 +712,11 @@ def main() -> None:
     ap.add_argument("--max-width", type=int, default=1280)
     ap.add_argument("--log-features", default=None)
     ap.add_argument("--speed-mps", type=float, default=None)
+    ap.add_argument("--force", action="store_true", help="Override safeguard check on filename")
+    ap.add_argument("--imu-csv", default=None, help="Path to IMU CSV log file")
+    ap.add_argument("--serial-port", default=None, help="Arduino serial port (e.g. COM3)")
+    ap.add_argument("--baud", type=int, default=115200, help="Serial baud rate")
+    ap.add_argument("--dry-run", action="store_true", help="Run serial output in dry-run simulation mode")
     a = ap.parse_args()
     
     setup_logging()
@@ -643,7 +724,7 @@ def main() -> None:
     if a.frame_skip:
         cfg["inference"]["frame_skip"] = a.frame_skip
     src = int(a.source) if a.source.isdigit() else a.source
-    run_video(cfg, src, str(resolve_path(a.output)), checkpoint=a.checkpoint, max_frames=a.max_frames, display=a.display or None, max_width=a.max_width, log_features=a.log_features, speed_mps=a.speed_mps)
+    run_video(cfg, src, str(resolve_path(a.output)), checkpoint=a.checkpoint, max_frames=a.max_frames, display=a.display or None, max_width=a.max_width, log_features=a.log_features, speed_mps=a.speed_mps, force=a.force, imu_csv=a.imu_csv, serial_port=a.serial_port, serial_baud=a.baud, serial_dry_run=a.dry_run)
 
 if __name__ == "__main__":
     main()

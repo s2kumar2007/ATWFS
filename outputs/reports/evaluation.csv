@@ -2,5 +2,5 @@ metric,value
 miou_idd,0.9468960018767324
 iou_nondrivable,0.9717469490602744
 iou_drivable,0.9220450546931904
-terrain_acc,nan
+terrain_acc,not trained (out of scope)
 ece,0.0020083195390576927

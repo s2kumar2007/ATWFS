@@ -14,6 +14,8 @@ class Command:
     width_frac: float
     centroid_x: float
     obstacle_proximity: float
+    width_m: Optional[float] = None
+    offset_m: Optional[float] = None
     
     @property
     def packet(self) -> str:
@@ -37,7 +39,8 @@ def subtract_obstacles(mask: np.ndarray, dets: List[Detection], dilate_px: int) 
     return out
 
 def compute_command(mask: np.ndarray, dets: List[Detection], trust: float, terrain: int,
-                    cfg: Dict[str, Any], raw_mask: Optional[np.ndarray] = None) -> Command:
+                    cfg: Dict[str, Any], raw_mask: Optional[np.ndarray] = None,
+                    road_width_m: Optional[float] = None, lateral_offset_m: Optional[float] = None) -> Command:
     h, w = mask.shape
     
     # 1. Hood apex calculation
@@ -48,7 +51,7 @@ def compute_command(mask: np.ndarray, dets: List[Detection], trust: float, terra
     # We find the bottom-most non-zero row in `mask`.
     nz_y, nz_x = np.nonzero(mask)
     if len(nz_y) == 0:
-        return Command(0.0, 0.0, trust, False, 0.0, w / 2, 0.0)
+        return Command(0.0, 0.0, trust, False, 0.0, w / 2, 0.0, width_m=road_width_m, offset_m=lateral_offset_m)
         
     bottom_y = np.max(nz_y)
     
@@ -83,11 +86,17 @@ def compute_command(mask: np.ndarray, dets: List[Detection], trust: float, terra
         width_frac = 0.0
 
     # Steer angle
-    dx = cx - (w / 2)
-    dy = h - y_start
-    angle_rad = math.atan2(dx, dy)
-    angle_deg = math.degrees(angle_rad)
-    angle_deg = max(-cfg["max_steer_deg"], min(cfg["max_steer_deg"], angle_deg))
+    if lateral_offset_m is not None:
+        lookahead_m = float(cfg.get("bev_lookahead_m", 6.0))
+        angle_rad = math.atan2(lateral_offset_m, lookahead_m)
+        angle_deg = math.degrees(angle_rad)
+        angle_deg = max(-cfg["max_steer_deg"], min(cfg["max_steer_deg"], angle_deg))
+    else:
+        dx = cx - (w / 2)
+        dy = h - y_start
+        angle_rad = math.atan2(dx, dy)
+        angle_deg = math.degrees(angle_rad)
+        angle_deg = max(-cfg["max_steer_deg"], min(cfg["max_steer_deg"], angle_deg))
 
     # Obstacle Check
     corridor = cfg["corridor_half_width"] * w
@@ -112,7 +121,11 @@ def compute_command(mask: np.ndarray, dets: List[Detection], trust: float, terra
     speed *= max(0.5, trust)
     
     # Width handicap
-    if width_frac < cfg["width_ref"]:
+    if road_width_m is not None:
+        ref_w = float(cfg.get("road_width_ref_m", 3.5))
+        if road_width_m < ref_w:
+            speed *= max(0.3, road_width_m / ref_w)
+    elif width_frac < cfg["width_ref"]:
         speed *= max(0.3, width_frac / cfg["width_ref"])
 
     # Obstacle speed drop
@@ -131,4 +144,4 @@ def compute_command(mask: np.ndarray, dets: List[Detection], trust: float, terra
     if speed < 0.1:
         speed = 0.0
 
-    return Command(angle_deg, speed, trust, obs_flag, width_frac, cx, prox)
+    return Command(angle_deg, speed, trust, obs_flag, width_frac, cx, prox, width_m=road_width_m, offset_m=lateral_offset_m)

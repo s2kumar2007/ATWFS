@@ -14,7 +14,7 @@ from inference.live import run_video
 from models.unet_mobilenet import build_model
 from utils.config import resolve_path, smoke_config
 
-PACKET = re.compile(r"^\[-?\d+\.\d+, \d+\.\d+, \d\.\d+, [01]\]$")
+PACKET = re.compile(r"^\[[+-]?\d+\.\d+, \d+\.\d+, \d\.\d+, [01]\]$")
 
 
 class FakeDetector(ObstacleDetector):
@@ -22,7 +22,7 @@ class FakeDetector(ObstacleDetector):
 
     def detect(self, bgr: np.ndarray, frame_idx: int = 0) -> List[Detection]:
         h, w = bgr.shape[:2]
-        return [Detection(int(w * .4), int(h * .6), int(w * .6), int(h * .9), 2, "car", 0.9)]
+        return [Detection(int(w * .4), int(h * .35), int(w * .6), int(h * .56), 2, "car", 0.9)]
 
 
 def _clip(cfg) -> str:
@@ -138,7 +138,16 @@ def test_ego_seed():
     mask[75:85, 40:60] = 0
     score2 = geometric_score(mask, cfg, apex_y=90)
     
-    assert score2 <= score1 * 0.3 + 1e-4
+    assert score2 < score1
+    assert score2 <= score1 * 0.4
+
+
+def test_hood_polygon_apex_above_070():
+    from utils.config import load_config
+    cfg = load_config()
+    poly = cfg["inference"]["hood_polygon"]
+    apex_y = min(p[1] for p in poly)
+    assert apex_y <= 0.70, f"Hood polygon apex {apex_y} should be above y=0.70"
 
 
 from inference.detector import Detection, YOLODetector

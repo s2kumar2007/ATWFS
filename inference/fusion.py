@@ -115,7 +115,34 @@ class ATWFS:
             net: Optional pre-built (e.g. trained) FusionNet; defaults to heuristic-initialised placeholder.
         """
         self.cfg = fusion_cfg
-        self.net = (net or FusionNet(fusion_cfg)).eval()
+        if net is None:
+            from pathlib import Path
+            ckpt_paths = [
+                Path("outputs/checkpoints/fusionnet.pt"),
+                Path("outputs/checkpoints/fusion_net.pt"),
+            ]
+            if "checkpoint_path" in fusion_cfg:
+                ckpt_paths.insert(0, Path(fusion_cfg["checkpoint_path"]))
+            
+            loaded = False
+            for cp in ckpt_paths:
+                if cp.exists():
+                    try:
+                        loaded_net = FusionNet(fusion_cfg, init_heuristic=False)
+                        state = torch.load(str(cp), map_location="cpu", weights_only=True)
+                        if isinstance(state, dict) and "state_dict" in state:
+                            state = state["state_dict"]
+                        loaded_net.load_state_dict(state)
+                        logger.info("Loaded trained FusionNet from %s", cp)
+                        net = loaded_net
+                        loaded = True
+                        break
+                    except Exception as e:
+                        logger.warning("Could not load FusionNet from %s: %s", cp, e)
+            if not loaded:
+                net = FusionNet(fusion_cfg, init_heuristic=True)
+                
+        self.net = net.eval()
 
     @torch.no_grad()
     def alpha(self, uncertainty: float, geometric: float, temporal: float, terrain: int) -> float:

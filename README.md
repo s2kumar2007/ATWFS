@@ -1,76 +1,109 @@
-# Vision-Based Road Drivable-Region Estimation for Lane-Less Roads
+# Vision-Based Road Drivable-Region Estimation for Lane-Less Roads (ATWFS)
 
-Multi-task PyTorch pipeline (IDD 20k Part I): MobileNetV3-Large U-Net with binary segmentation, a single-pass
-**evidential (Dirichlet)** uncertainty head, a 4-class terrain head and deep supervision; GroupNorm throughout;
-Kendall-style learnable loss weights; distillation to MobileNetV3-Small; INT8 / structured-pruning comparison;
-classical fallback + geometric/temporal checks + trust fusion; threaded live inference with YOLOv8n obstacle subtraction.
+Adaptive Trust-Weighted Free-Space (ATWFS) estimation pipeline in PyTorch (IDD 20k Part I):
+- **Backbone & Heads:** MobileNetV3-Large (Teacher) and MobileNetV3-Small (Distilled Student) U-Net with binary drivable segmentation, single-pass **evidential (Dirichlet)** uncertainty, optional **night-mode decoder** with road-luminance hysteresis, and deep supervision (`GroupNorm` throughout).
+- **Self-Calibrating IPM:** Online vanishing-point horizon tracker + optional IMU complementary filter (`inference/ipm.py`) projecting the drivable mask into a bird's-eye metric corridor (road width and lateral offset in metres).
+- **Trained Trust Fusion (`ATWFS`):** MLP (`FusionNet`) trained on per-frame validation features $(U, G, T, \text{terrain}=0)$ to blend deep-learning probabilities with a classical HSV/Lab + Canny + FloodFill fallback (`training/fusion_train.py`, `inference/fusion.py`).
+- **Obstacle Subtraction & Hardware Link:** Synchronous/threaded YOLOv8 obstacle tracking (`inference/detector.py`), dome-shaped ego-hood masking (`inference/calibrate_roi.py`), and serial packet output (`inference/serial_out.py`) with Arduino firmware safety clamping (`arduino/safety_clamp/safety_clamp.ino`).
 
-## 1. First things to do
-1. `pip install -r requirements.txt`
-2. If using the Kaggle "archive" set (`image_archive/` and `mask_archive/`), it must first be converted into the standard IDD format. Run:
-   `python convert_idd.py --images image_archive --masks mask_archive --out ./data/idd_converted`
-3. **Update `paths.data_root` in `config.yaml`** to your converted folder (default `./data/idd_converted`).
-4. Verify the install: `python run_all_smoke_tests.py` (no data/GPU needed).
+> **Scope Note (Explicitly Out of Scope):**
+> 1. **Terrain classification head training** is out of scope (`inference.use_terrain: false` and `terrain = 0` everywhere; `terrain_acc` is reported as `"not trained (out of scope)"`).
+> 2. **Own-dataset / CVAT / SAM auto-labelling tools** are out of scope.
 
-## 2. Folder structure
+---
+
+## 1. Quick Start & Setup
+
+1. Install CPU dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+   *(Optional for NVIDIA GPU)* Install CUDA wheels:
+   ```bash
+   pip install -r requirements-cuda.txt
+   ```
+2. Download or verify model weights:
+   ```bash
+   python scripts/download_weights.py
+   ```
+3. If converting the Kaggle IDD archive (`image_archive/` and `mask_archive/`):
+   ```bash
+   python convert_idd.py --images image_archive --masks mask_archive --out ./data/idd_converted
+   ```
+4. Run all 11 smoke test stages and the full pytest suite:
+   ```bash
+   python run_all_smoke_tests.py
+   pytest
+   ```
+
+---
+
+## 2. Repository Structure
+
+```text
+config.yaml                  All paths, camera intrinsics, hood polygon, and hyperparameters
+MODEL_CARD.md                Architecture details, measured metrics, latency, and safety limits
+run_all_smoke_tests.py       Runs all 11 stage smoke tests in order
+scripts/
+  download_weights.py        Downloads checkpoints from paths.weights_url in config.yaml
+  reproduce.ps1              End-to-end reproduction script (Windows PowerShell)
+  reproduce.sh               End-to-end reproduction script (Linux/macOS Bash)
+arduino/
+  safety_clamp/
+    safety_clamp.ino         Arduino firmware enforcing turn-radius, rate, and trust clamps
+data/
+  labels.py                  IDD level-3 hierarchy and binary drivable collapse
+  dataset.py                 IDD & synthetic dataset loaders
+  augment.py                 Standard + rare-condition + synthetic night darkening augmentations
+  synthetic.py               Procedural driving scenes and synthetic video generator
+models/
+  unet_mobilenet.py          MultiTaskUNet (day + night decoders, evidential head, GroupNorm)
+  compression.py             FX static INT8 PTQ, structured L1 decoder pruning, FPS/size helpers
+training/
+  losses.py                  Focal + Dice + Evidential KL + Kendall multi-task loss
+  metrics.py                 Confusion matrix and pixel ECE accumulators
+  train.py                   Teacher training pipeline
+  distill.py                 Knowledge distillation (Teacher -> Student)
+  finetune_night.py          Night decoder fine-tuning on darkened or real night images
+  fusion_train.py            Trains FusionNet on validation (U, G, T) features + ablation CSV
+inference/
+  calibrate_roi.py           Interactive/automated dome hood polygon calibration
+  classical.py               Classical HSV/Lab + Canny + FloodFill road fallback
+  consistency.py             Geometric (G) and warper-based temporal (T) consistency scores
+  ipm.py                     Self-calibrating Inverse Perspective Mapping + IMU complementary filter
+  fusion.py                  ATWFS adaptive trust fusion (loads outputs/checkpoints/fusionnet.pt)
+  detector.py                YOLOv8 obstacle detector + IoU tracker with track expiry
+  decision.py                Metric/pixel steering & speed control law + obstacle subtraction
+  serial_out.py              PySerial / dry-run transmitter for [angle, speed, trust, obs]
+  live.py                    Real-time video inference, HUD overlay, and H.264 output writer
+evaluation/
+  evaluate.py                AutoNUE-style official mIoU and ECE evaluation
+  benchmark.py               Teacher vs Student vs INT8 PTQ vs Pruned benchmark
+  external_eval.py           BDD100K zero-shot cross-dataset evaluation
+  slide_metrics.py           Hardware & latency profiler (GMACs, GFLOPs, ms/frame, RAM)
+  failure_taxonomy.py        Automated failure tagging and worst-frame extractor
+  gradcam.py                 Grad-CAM explainability visualiser
+tests/                       Comprehensive unit and stage smoke tests
 ```
-config.yaml                every path / hyperparameter
-run_all_smoke_tests.py     runs all stage smoke tests in order
-data/        labels.py (hierarchy + collapse) | dataset.py (IDD + synthetic, official splits) |
-             augment.py (standard + independent rare-condition module) | synthetic.py (fake scenes/videos)
-models/      unet_mobilenet.py (multi-task net) | compression.py (INT8 PTQ, structured pruning, size/FPS)
-training/    losses.py | metrics.py | train.py | distill.py | fusion_train.py (STUB)
-inference/   classical.py | consistency.py | fusion.py (ATWFS) | detector.py | decision.py | live.py
-evaluation/  evaluate.py (AutoNUE-style mIoU) | benchmark.py | failure_taxonomy.py | gradcam.py
-utils/       config, seed/device, logging
-tests/       one smoke test per stage
-notebooks/   colab_train.ipynb
-```
 
-## 3. How to run
-| Task | Command | Where |
-|---|---|---|
-| All smoke tests | `python run_all_smoke_tests.py` | Windows CPU OK |
-| 2-epoch pipeline sanity run | `python -m training.train --cpu-fallback` | Windows CPU OK (<1 min) |
-| Train teacher on IDD | `python -m training.train` | **GPU/Colab** |
-| Distil student | `python -m training.distill` | **GPU/Colab** (CPU only for tiny tests) |
-| Compression benchmark | `python -m evaluation.benchmark` (add `--synthetic` for a dry run) | CPU OK (INT8 FPS is CPU by design); real val set is faster on GPU for accuracy |
-| Evaluate (IDD protocol) | `python -m evaluation.evaluate --checkpoint outputs/checkpoints/teacher_best.pt` | CPU OK, GPU faster |
-| Failure taxonomy | `python -m evaluation.failure_taxonomy --checkpoint ... --save-failures` | CPU OK |
-| Grad-CAM (offline) | `python -m evaluation.gradcam --checkpoint ... --images outputs/reports/failures` | CPU OK |
-| Live / video inference | `python -m inference.live --source video.mp4 --checkpoint ...` (`--source 0` webcam, rtsp/http URL IP cam) | CPU OK |
-| FusionNet training | `python -m training.fusion_train` | STUB: needs data that does not exist yet |
+---
 
-Device is chosen automatically with `torch.cuda.is_available()`. Seeds (torch/numpy/random) are set in every entry point.
-Add `--synthetic` to train/distill/evaluate to use procedurally generated data. Colab: `notebooks/colab_train.ipynb`
-(or `training.train.colab_setup()`); IDD needs registration so place it in Drive and set `IDD_DRIVE_PATH`.
+## 3. Common Commands
 
-## 4. IDD details (confirmed vs. to-verify)
-* **Dataset Note**: The reported mIoU in our results is on a custom `val` split of the Kaggle data, **not** the official IDD val split.
-* masks: `gtFine/{split}/{drive}/{id}_gtFine_labellevel3Ids.png`; images `leftImg8bit/{split}/{drive}/{id}_leftImg8bit.png`/{split}/{drive}/{id}_gtFine_labellevel3Ids.png`; images `leftImg8bit/{split}/{drive}/{id}_leftImg8bit.png`
-* level-3 ids: road = 0; parking **and** drivable fallback = 1 (both level1 "drivable"); sidewalk = 2;
-  non-drivable fallback = 3; 255 = unlabeled. => drivable = `{0, 1}` (`data.drivable_level3_ids`). Unlabeled -> non-drivable.
-* mIoU: 27x27 confusion matrix with an ignore bucket, FP includes ignored-GT pixels (`evaluation/evaluate.py`).
+| Task | Command |
+|---|---|
+| Run all smoke tests (11 stages) | `python run_all_smoke_tests.py` |
+| Run full unit test suite | `pytest` |
+| Calibrate dome hood polygon | `python -m inference.calibrate_roi --source dashcam_raw.mp4 --auto` |
+| Live / raw video inference | `python -m inference.live --source dashcam_raw.mp4 --checkpoint outputs/checkpoints/student_best.pt` |
+| Video inference + IMU + Serial dry-run | `python -m inference.live --source dashcam_raw.mp4 --imu-csv imu.csv --dry-run` |
+| Train teacher on IDD | `python -m training.train` |
+| Distil student | `python -m training.distill` |
+| Fine-tune night decoder | `python -m training.finetune_night --checkpoint outputs/checkpoints/student_best.pt --synthetic` |
+| Train FusionNet & ablation CSV | `python -m training.fusion_train --checkpoint outputs/checkpoints/student_best.pt` |
+| Evaluate checkpoint (IDD protocol) | `python -m evaluation.evaluate --checkpoint outputs/checkpoints/student_best.pt` |
+| Compression benchmark | `python -m evaluation.benchmark` |
+| Cross-dataset BDD100K evaluation | `python -m evaluation.external_eval --bdd100k-dir /path/to/bdd100k --checkpoint outputs/checkpoints/student_best.pt` |
+| End-to-end reproduce (PowerShell) | `powershell -ExecutionPolicy Bypass -File scripts/reproduce.ps1 -Synthetic` |
 
-**TODO (you, once):** these were confirmed from the official *code*, not from your downloaded files. Run
-`python -m data.labels --data-root <idd>`; it scans masks and errors on any unexpected id. If your files differ, edit
-`data.drivable_level3_ids` / `data.mask_suffix` in `config.yaml`.
-
-Known data caveats:
-* The **public IDD test split has no ground-truth masks**; `data.eval_split` (default `val`) is used for evaluation/benchmarks.
-  Split sizes are checked against 6,993 / 981 / 2,029 and a warning is logged on mismatch.
-* **IDD has no terrain labels**: on real data the terrain label is -1 (ignored by the loss, so the terrain head is untrained
-  there). Supply your own terrain labels (TODO) to train/evaluate it. Synthetic data carries terrain labels.
-
-## 5. Placeholders / stubs (all commented in code)
-* `inference/fusion.py` - FusionNet is initialised to a **hand-coded heuristic** (reproduced exactly); `training/fusion_train.py` is a stub awaiting real data.
-* `inference/detector.py` - pretrained COCO YOLOv8n; `CattleDetectorPlaceholder` / `CompositeDetector` mark where a fine-tuned cattle detector plugs in.
-* `inference/live.py` - the `[angle, speed, trust_score, obstacle_flag]` console line is a **stub for a future Arduino link**. No serial/hardware code exists.
-* `speed_mps_input` (temporal check) is a constant config value until real odometry is available.
-
-## 6. Notes
-* Speed formula, steering formula and obstacle logic are documented at the top of `inference/decision.py`.
-* ImageNet weights download on first use (torchvision). If the download fails the encoder falls back to random init **with a warning**.
-* INT8: FX-graph static PTQ (`torch.ao`), calibrated on val batches; torch marks `torch.ao.quantization` as deprecated (migration path: torchao). Falls back to dynamic INT8 / flagged fp32 copy if unavailable.
-* Structured pruning removes decoder-internal channels only (real size reduction; encoder untouched). INT8/pruning are applied to the teacher by default (`--base student` to change).
-* Untrained/random-weight models give meaningless metrics - the logs say so when a checkpoint is missing.
+> **Important Safeguard:** `inference/live.py` inspects the input video basename and refuses to run on already-annotated files (filenames containing `"result"` or `"annotated"`) unless `--force` is explicitly passed. Always test inference on raw dashcam video (`dashcam_raw.mp4`).

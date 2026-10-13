@@ -7,4 +7,4 @@ outputs/checkpoints/
 outputs/weights/
 *.pt
 *.mp4
-__pycache__/
+outputs/inference/*.csv

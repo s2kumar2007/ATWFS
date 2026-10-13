@@ -154,6 +154,41 @@ class MobileNetV3Encoder(nn.Module):
         return outs
 
 
+class SegmentationDecoder(nn.Module):
+    """Separate decoder branch for multi-task segmentation (used for night decoder)."""
+
+    def __init__(self, c_enc: Sequence[int], decoder_channels: Sequence[int] = (128, 64, 40, 24),
+                 gn_max_groups: int = 8, seg_classes: int = 2, evidence_clip: float = 1000.0) -> None:
+        super().__init__()
+        c2, c4, c8, c16, c32 = c_enc
+        d16, d8, d4, d2 = decoder_channels
+        self.evidence_clip = evidence_clip
+        self.dec16 = DecoderBlock(c32, c16, d16, gn_max_groups)
+        self.dec8 = DecoderBlock(d16, c8, d8, gn_max_groups)
+        self.dec4 = DecoderBlock(d8, c4, d4, gn_max_groups)
+        self.dec2 = DecoderBlock(d4, c2, d2, gn_max_groups)
+        self.final = ConvGNAct(d2, d2, 3, gn_max_groups)
+        self.seg_head = nn.Conv2d(d2, seg_classes, 1)
+        self.evid_conv = ConvGNAct(d2, d2, 3, gn_max_groups)
+        self.evid_head = nn.Conv2d(d2, seg_classes, 1)
+        self.aux_heads = nn.ModuleList([nn.Conv2d(d8, seg_classes, 1), nn.Conv2d(d4, seg_classes, 1)])
+
+    def forward(self, features: Sequence[torch.Tensor], size: Sequence[int]) -> Dict[str, Any]:
+        f2, f4, f8, f16, f32 = features
+        d16 = self.dec16(f32, f16)
+        d8 = self.dec8(d16, f8)
+        d4 = self.dec4(d8, f4)
+        d2 = self.dec2(d4, f2)
+        feat = self.final(F.interpolate(d2, size=size, mode="bilinear", align_corners=False))
+        seg = self.seg_head(feat)
+        evidence = F.softplus(self.evid_head(self.evid_conv(feat))).clamp(max=self.evidence_clip)
+        return {
+            "seg_logits": seg,
+            "alpha": evidence + 1.0,
+            "aux_logits": [self.aux_heads[0](d8), self.aux_heads[1](d4)],
+        }
+
+
 class MultiTaskUNet(nn.Module):
     """Multi-task U-Net with MobileNetV3 encoder.
 
@@ -183,6 +218,8 @@ class MultiTaskUNet(nn.Module):
         """
         super().__init__()
         self.seg_classes, self.evidence_clip = seg_classes, evidence_clip
+        self.decoder_channels = list(decoder_channels)
+        self.gn_max_groups = gn_max_groups
         self.encoder = MobileNetV3Encoder(encoder, pretrained, gn_max_groups)
         c2, c4, c8, c16, c32 = self.encoder.channels
         d16, d8, d4, d2 = decoder_channels
@@ -198,31 +235,70 @@ class MultiTaskUNet(nn.Module):
         self.terrain_conv = ConvGNAct(c8, terrain_hidden, 3, gn_max_groups)  # mid-level (stride 8) branch
         self.terrain_drop = nn.Dropout(terrain_dropout)
         self.terrain_fc = nn.Linear(terrain_hidden, terrain_classes)
+        self.night_decoder: Optional[SegmentationDecoder] = None
+        self.mode: str = "day"
 
-    def forward(self, x: torch.Tensor) -> Dict[str, Any]:
+    def set_mode(self, mode: str) -> None:
+        """Set active decoder mode ('day' or 'night')."""
+        if mode not in ("day", "night"):
+            raise ValueError(f"Unknown mode '{mode}', expected 'day' or 'night'")
+        self.mode = mode
+
+    def add_night_decoder(self) -> SegmentationDecoder:
+        """Add a separate night decoder branch, warm-started from day decoder weights."""
+        if self.night_decoder is None:
+            self.night_decoder = SegmentationDecoder(
+                self.encoder.channels, self.decoder_channels, self.gn_max_groups,
+                self.seg_classes, self.evidence_clip
+            )
+            # Warm start from existing day decoder weights
+            self.night_decoder.dec16.load_state_dict(self.dec16.state_dict())
+            self.night_decoder.dec8.load_state_dict(self.dec8.state_dict())
+            self.night_decoder.dec4.load_state_dict(self.dec4.state_dict())
+            self.night_decoder.dec2.load_state_dict(self.dec2.state_dict())
+            self.night_decoder.final.load_state_dict(self.final.state_dict())
+            self.night_decoder.seg_head.load_state_dict(self.seg_head.state_dict())
+            self.night_decoder.evid_conv.load_state_dict(self.evid_conv.state_dict())
+            self.night_decoder.evid_head.load_state_dict(self.evid_head.state_dict())
+            self.night_decoder.aux_heads.load_state_dict(self.aux_heads.state_dict())
+        return self.night_decoder
+
+    def forward(self, x: torch.Tensor, mode: Optional[str] = None) -> Dict[str, Any]:
         """Forward pass.
 
         Args:
             x: ``(B,3,H,W)`` normalised images.
+            mode: Optional override ('day' or 'night'). Defaults to self.mode.
 
         Returns:
             Output dict (see class docstring).
         """
         size = x.shape[-2:]
         f2, f4, f8, f16, f32 = self.encoder(x)
-        d16 = self.dec16(f32, f16)
-        d8 = self.dec8(d16, f8)
-        d4 = self.dec4(d8, f4)
-        d2 = self.dec2(d4, f2)
-        feat = self.final(F.interpolate(d2, size=size, mode="bilinear", align_corners=False))
-        seg = self.seg_head(feat)
-        evidence = F.softplus(self.evid_head(self.evid_conv(feat))).clamp(max=self.evidence_clip)
+        
+        target_mode = (mode or self.mode).lower()
+        if target_mode == "night" and self.night_decoder is not None:
+            dec_out = self.night_decoder([f2, f4, f8, f16, f32], size)
+            seg = dec_out["seg_logits"]
+            alpha = dec_out["alpha"]
+            aux = dec_out["aux_logits"]
+        else:
+            d16 = self.dec16(f32, f16)
+            d8 = self.dec8(d16, f8)
+            d4 = self.dec4(d8, f4)
+            d2 = self.dec2(d4, f2)
+            feat = self.final(F.interpolate(d2, size=size, mode="bilinear", align_corners=False))
+            seg = self.seg_head(feat)
+            evidence = F.softplus(self.evid_head(self.evid_conv(feat))).clamp(max=self.evidence_clip)
+            alpha = evidence + 1.0
+            aux = [self.aux_heads[0](d8), self.aux_heads[1](d4)]
+
         t = self.terrain_conv(f8).mean(dim=(2, 3))
         return {
             "seg_logits": seg,
-            "alpha": evidence + 1.0,
+            "alpha": alpha,
             "terrain_logits": self.terrain_fc(self.terrain_drop(t)),
-            "aux_logits": [self.aux_heads[0](d8), self.aux_heads[1](d4)],
+            "aux_logits": aux,
         }
 
 

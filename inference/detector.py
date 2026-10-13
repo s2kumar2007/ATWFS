@@ -85,6 +85,8 @@ class YOLODetector(ObstacleDetector):
         
         self.track_histories: Dict[int, Deque[int]] = collections.defaultdict(lambda: collections.deque(maxlen=5))
         self.ema_rates: Dict[int, float] = {}
+        self.last_seen: Dict[int, int] = {}
+        self.imgsz = cfg.get("imgsz", 960)
         
     def _get_kind(self, cls_id: int) -> str:
         if cls_id == 0: return "person"
@@ -104,7 +106,7 @@ class YOLODetector(ObstacleDetector):
         results_full = self.model.track(
             bgr, persist=True, conf=self.conf, iou=self.iou,
             agnostic_nms=self.agnostic_nms, classes=list(self.allowed_classes),
-            imgsz=960, verbose=False, tracker="botsort.yaml"
+            imgsz=self.imgsz, verbose=False, tracker="botsort.yaml"
         )[0]
         
         # Second pass: small far objects
@@ -116,7 +118,7 @@ class YOLODetector(ObstacleDetector):
         results_crop = self.model.predict(
             crop_up, conf=self.conf, iou=self.iou,
             agnostic_nms=self.agnostic_nms, classes=list(self.allowed_classes),
-            imgsz=960, verbose=False
+            imgsz=self.imgsz, verbose=False
         )[0]
         
         dets = []
@@ -155,9 +157,10 @@ class YOLODetector(ObstacleDetector):
         # Merge duplicates (IoU > 0.5)
         merged = merge_boxes(dets, iou_thresh=0.5)
         
-        # Compute approach rate for merged boxes
+        # Compute approach rate for merged boxes and update last_seen
         for d in merged:
             if d.tracker_id is not None:
+                self.last_seen[d.tracker_id] = frame_idx
                 hist = self.track_histories[d.tracker_id]
                 hist.append(d.height)
                 
@@ -168,13 +171,12 @@ class YOLODetector(ObstacleDetector):
                     self.ema_rates[d.tracker_id] = rate
                     d.approach_rate = rate
         
-        # Cleanup old tracks
-        active_ids = {d.tracker_id for d in merged if d.tracker_id is not None}
-        for trk_id in list(self.track_histories.keys()):
-            if trk_id not in active_ids:
-                if len(self.track_histories[trk_id]) > 0:
-                    # just clear it if not seen? Wait, YOLO tracks persist, but if it disappears for a while, we can clear to save memory.
-                    pass # let's just let it grow for now or rely on tracker.
+        # Cleanup old tracks not seen for 30 frames
+        stale_ids = [tid for tid, last_f in self.last_seen.items() if frame_idx - last_f > 30]
+        for tid in stale_ids:
+            self.track_histories.pop(tid, None)
+            self.ema_rates.pop(tid, None)
+            self.last_seen.pop(tid, None)
         
         logger.debug(f"Frame {frame_idx}: Detected {len(merged)} objects.")
         return merged

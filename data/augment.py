@@ -209,3 +209,27 @@ class SyntheticConditionAugment:
         if fx.get("enabled") and self.rng.random() < fx["p"]:
             img = self.dust(img, float(self.rng.uniform(0.15, fx["max_density"])))
         return img
+
+    def darken(self, img: np.ndarray, factor: float = 0.25, gamma: float = 1.8, noise_std: float = 4.0) -> np.ndarray:
+        """Darken an image to simulate low-light / night conditions."""
+        return synthetic_darken(img, factor=factor, gamma=gamma, noise_std=noise_std)
+
+
+def synthetic_darken(img: np.ndarray, factor: float = 0.25, gamma: float = 1.8, noise_std: float = 4.0) -> np.ndarray:
+    """Simulate low-light / dusk / night conditions on an RGB uint8 image.
+
+    Applies non-linear gamma curve, brightness attenuation, cool color temperature shift,
+    and sensor noise.
+    """
+    x = img.astype(np.float32) / 255.0
+    x = np.power(x, gamma) * factor
+    # Cool twilight / nighttime tone adjustment
+    x[..., 0] *= 0.85  # R
+    x[..., 1] *= 0.95  # G
+    x[..., 2] *= 1.10  # B
+    out = np.clip(x * 255.0, 0, 255).astype(np.float32)
+    if noise_std > 0:
+        noise = np.random.normal(0, noise_std, out.shape).astype(np.float32)
+        out = np.clip(out + noise, 0, 255)
+    return out.astype(np.uint8)
+
