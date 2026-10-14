@@ -14,6 +14,9 @@ import collections
 from dataclasses import dataclass
 import logging
 from pathlib import Path
+import queue
+import threading
+import time
 from types import SimpleNamespace
 from typing import Any, Deque, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -36,6 +39,8 @@ class Detection:
     kind: str = "vehicle"
     approach_rate: float = 1.0
     tracker_id: Optional[int] = None
+    last_update_frame: int = 0
+    consecutive_detections: int = 1
 
     @property
     def height(self) -> int:
@@ -61,6 +66,9 @@ class ObstacleDetector(abc.ABC):
 
     def stop(self) -> None:
         pass
+
+    def close(self) -> None:
+        self.stop()
 
 
 class NullDetector(ObstacleDetector):
@@ -154,10 +162,54 @@ class YOLODetector(ObstacleDetector):
         self.track_histories: Dict[int, Deque[int]] = collections.defaultdict(lambda: collections.deque(maxlen=5))
         self.ema_rates: Dict[int, float] = {}
         self.last_seen: Dict[int, int] = {}
+        self.last_real_detection_frame: Dict[int, int] = {}
+        self.consecutive_detection_count: Dict[int, int] = {}
 
         self._last_shape: Optional[Tuple[int, int]] = None
         self._last_active_dets: List[Detection] = []
         self._next_track_id = 10000
+        self._last_tracker_frame: Optional[int] = None
+
+        self.active_pass_samples: List[float] = []
+        self.overhead_samples: List[float] = []
+
+        # Warm-up pass once so first video frame does not stall
+        try:
+            dummy = np.zeros((160, 160, 3), dtype=np.uint8)
+            self.model.predict(dummy, imgsz=160, device=self.device_str, verbose=False)
+        except Exception:
+            pass
+
+        # Background worker for active YOLO inference
+        self._worker_queue: queue.Queue[Optional[Tuple[np.ndarray, int]]] = queue.Queue(maxsize=1)
+        self._result_queue: queue.Queue[Tuple[int, List[Detection], float]] = queue.Queue()
+        self._worker_busy = threading.Event()
+        self._stop_event = threading.Event()
+        self._worker_thread = threading.Thread(target=self._yolo_worker_loop, daemon=True)
+        self._worker_thread.start()
+
+    def _yolo_worker_loop(self) -> None:
+        try:
+            torch.set_num_threads(4)
+        except Exception:
+            pass
+        while not self._stop_event.is_set():
+            try:
+                task = self._worker_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if task is None:
+                break
+            bgr, frame_idx = task
+            try:
+                t0 = time.perf_counter()
+                dets = self._run_active_pass(bgr, frame_idx)
+                active_ms = (time.perf_counter() - t0) * 1000.0
+                self._result_queue.put((frame_idx, dets, active_ms))
+            except Exception as exc:
+                logger.error("Error in YOLO active pass worker: %s", exc)
+            finally:
+                self._worker_busy.clear()
 
     def _load_yolo_model(self, weights_path: str, yolo_cls: Any) -> Any:
         ckpt_dir = self.output_dir / "checkpoints"
@@ -201,22 +253,8 @@ class YOLODetector(ObstacleDetector):
             return self.thr_animal
         return self.thr_vehicle
 
-    def detect(self, bgr: np.ndarray, frame_idx: int = 0) -> List[Detection]:
-        """Detect obstacles with dual-pass predict + standalone BYTETracker."""
+    def _run_active_pass(self, bgr: np.ndarray, frame_idx: int) -> List[Detection]:
         h, w = bgr.shape[:2]
-
-        # Fail fast if consecutive frames ever differ in size
-        if self._last_shape is not None and (h, w) != self._last_shape:
-            raise ValueError(
-                f"Frame size changed from {self._last_shape} to {(h, w)}. "
-                f"Detector requires constant resolution across video frames."
-            )
-        self._last_shape = (h, w)
-
-        # Honour detector.every_n: on skipped frames propagate active boxes with tracker Kalman state
-        if self.every_n > 1 and (frame_idx % self.every_n != 0) and self._last_active_dets:
-            return self._propagate_skipped_frame(frame_idx)
-
         is_half = (self.device_type == "cuda")
         predict_kwargs: Dict[str, Any] = {
             "conf": self.conf,
@@ -246,34 +284,58 @@ class YOLODetector(ObstacleDetector):
                 if conf < self._get_threshold(kind):
                     continue
 
-                name = self.model.names[cls_id] if hasattr(self.model, "names") else str(cls_id)
+                raw_name = self.model.names[cls_id] if hasattr(self.model, "names") else str(cls_id)
+                if "auto" in raw_name.lower() or "rickshaw" in raw_name.lower():
+                    disp_name = "auto"
+                elif kind == "vehicle":
+                    disp_name = "vehicle"
+                elif kind == "person":
+                    disp_name = "person"
+                elif kind == "animal":
+                    disp_name = "animal"
+                else:
+                    disp_name = raw_name
+
                 rx1 = int(round((x1 / scale) + offset_x))
                 ry1 = int(round((y1 / scale) + offset_y))
                 rx2 = int(round((x2 / scale) + offset_x))
                 ry2 = int(round((y2 / scale) + offset_y))
 
-                dets.append(Detection(rx1, ry1, rx2, ry2, cls_id, name, float(conf), kind, 1.0, None))
+                # Clamp to frame bounds
+                rx1 = max(0, min(w - 1, rx1))
+                ry1 = max(0, min(h - 1, ry1))
+                rx2 = max(0, min(w - 1, rx2))
+                ry2 = max(0, min(h - 1, ry2))
+                if (rx2 - rx1) < 5 or (ry2 - ry1) < 5:
+                    continue
+
+                dets.append(
+                    Detection(
+                        rx1, ry1, rx2, ry2, cls_id, disp_name, float(conf), kind, 1.0, None,
+                        last_update_frame=frame_idx, consecutive_detections=1,
+                    )
+                )
 
         if self.device_type == "cpu":
-            # Road band pass (y from 0.28 to 0.65 of the frame) with rectangular inference at imgsz 640
-            y1_road, y2_road = int(0.28 * h), int(0.65 * h)
+            # Road band pass on full road region (y from 0.25 to 0.85) with rectangular inference at imgsz 480
+            y1_road, y2_road = int(0.25 * h), int(0.85 * h)
             road_crop = bgr[y1_road:y2_road, :]
             crop_kwargs = dict(predict_kwargs)
-            crop_kwargs["imgsz"] = 640
+            crop_kwargs["imgsz"] = 480
             crop_kwargs["rect"] = True
             results_crop = self.model.predict(road_crop, **crop_kwargs)[0]
             extract_boxes(results_crop.boxes, offset_y=y1_road)
 
-            # Merge with low-resolution full-frame pass only when fewer than 2 vehicles are found
+            # Low-resolution full-frame pass at most every 8th frame and only when fewer than 2 vehicles are found
             num_vehicles = sum(1 for d in dets if d.kind == "vehicle")
-            if num_vehicles < 2:
+            if (frame_idx % 8 == 0) and (num_vehicles < 2):
                 full_kwargs = dict(predict_kwargs)
                 full_kwargs["imgsz"] = 416
                 full_kwargs["rect"] = True
                 results_full = self.model.predict(bgr, **full_kwargs)[0]
                 extract_boxes(results_full.boxes)
         else:
-            # Pass 1: Full-frame predict (NEVER model.track)
+            # Pass 1: Full-frame predict (CUDA)
             results_full = self.model.predict(bgr, **predict_kwargs)[0]
             extract_boxes(results_full.boxes)
 
@@ -296,10 +358,65 @@ class YOLODetector(ObstacleDetector):
                 results_crop = self.model.predict(crop_in, **predict_kwargs)[0]
                 extract_boxes(results_crop.boxes, offset_y=y1_crop, scale=scale)
 
-        # Merge boxes in full-frame coordinates with IoU 0.5 class-agnostic NMS
         merged = merge_boxes(dets, iou_thresh=0.5)
+        return merged
 
-        # Standalone BYTETracker update strictly on full-frame merged boxes
+    def detect(self, bgr: np.ndarray, frame_idx: int = 0) -> List[Detection]:
+        """Detect obstacles without stalling the main pipeline thread."""
+        t0 = time.perf_counter()
+        h, w = bgr.shape[:2]
+
+        # Fail fast if consecutive frames ever differ in size
+        if self._last_shape is not None and (h, w) != self._last_shape:
+            raise ValueError(
+                f"Frame size changed from {self._last_shape} to {(h, w)}. "
+                f"Detector requires constant resolution across video frames."
+            )
+        self._last_shape = (h, w)
+
+        # 1. Drain newly completed active pass results from worker
+        received_new_result = False
+        while not self._result_queue.empty():
+            try:
+                res_idx, res_dets, active_ms = self._result_queue.get_nowait()
+                self.active_pass_samples.append(active_ms)
+                # Update tracker with newly arrived detections at res_idx
+                self._update_tracker_with_dets(res_dets, res_idx)
+                # Fast-forward tracker from res_idx + 1 up to current frame_idx
+                for ff_idx in range(res_idx + 1, frame_idx + 1):
+                    self._step_tracker_forward(ff_idx)
+                received_new_result = True
+            except queue.Empty:
+                break
+
+        # 2. Trigger worker on cadence if worker is idle
+        if frame_idx % self.every_n == 0:
+            if not self._worker_busy.is_set():
+                self._worker_busy.set()
+                try:
+                    self._worker_queue.put_nowait((bgr.copy(), frame_idx))
+                except queue.Full:
+                    self._worker_busy.clear()
+
+        # 3. If no new result was received or tracker needs propagation to current frame
+        if not received_new_result:
+            if self._last_tracker_frame is None or self._last_tracker_frame < frame_idx:
+                start_f = frame_idx if self._last_tracker_frame is None else self._last_tracker_frame + 1
+                for f in range(start_f, frame_idx + 1):
+                    self._step_tracker_forward(f)
+
+        t_ms = (time.perf_counter() - t0) * 1000.0
+        self.overhead_samples.append(t_ms)
+        # Every box drawn or used for decisions must come from a detection or tracker update within the last 3 frames;
+        # Never draw a box that hasn't been updated.
+        valid_dets = [
+            d for d in self._last_active_dets
+            if (frame_idx - self.last_real_detection_frame.get(d.tracker_id, -999)) <= 3
+        ]
+        return list(valid_dets)
+
+    def _update_tracker_with_dets(self, merged: List[Detection], frame_idx: int) -> None:
+        """Update BYTETracker with merged full-frame detections at frame_idx."""
         if merged:
             xywh = np.array([[d.center_x, d.center_y, float(d.width), float(d.height)] for d in merged], dtype=np.float32)
             scores = np.array([float(d.conf) for d in merged], dtype=np.float32)
@@ -309,22 +426,31 @@ class YOLODetector(ObstacleDetector):
 
             # Match tracker IDs to detections via track.idx
             matched_indices = set()
+            active_tids = set()
             for track in self.tracker.tracked_stracks:
                 idx = getattr(track, "idx", None)
                 if idx is not None and 0 <= idx < len(merged) and idx not in matched_indices:
-                    merged[idx].tracker_id = int(track.track_id)
+                    tid = int(track.track_id)
+                    merged[idx].tracker_id = tid
                     matched_indices.add(idx)
+                    active_tids.add(tid)
 
             # Assign fresh ID to any unmatched detection
             for idx, d in enumerate(merged):
                 if d.tracker_id is None:
                     d.tracker_id = self._next_track_id
+                    active_tids.add(self._next_track_id)
                     self._next_track_id += 1
 
-            # Update approach rate & track history
+            # Update approach rate, track history, and real detection timestamps
             for d in merged:
                 tid = d.tracker_id
                 self.last_seen[tid] = frame_idx
+                self.last_real_detection_frame[tid] = frame_idx
+                self.consecutive_detection_count[tid] = self.consecutive_detection_count.get(tid, 0) + 1
+                d.last_update_frame = frame_idx
+                d.consecutive_detections = self.consecutive_detection_count[tid]
+
                 hist = self.track_histories[tid]
                 hist.append(d.height)
                 if len(hist) > 1:
@@ -335,27 +461,40 @@ class YOLODetector(ObstacleDetector):
                     d.approach_rate = rate
                 else:
                     d.approach_rate = self.ema_rates.get(tid, 1.0)
+
+            # Reset consecutive count for tracks not detected in this pass
+            for tid in list(self.consecutive_detection_count.keys()):
+                if tid not in active_tids:
+                    self.consecutive_detection_count[tid] = 0
         else:
-            # Empty detection set: update tracker with empty array
             wrapper = _DetResultsWrapper(
                 np.empty((0, 4), dtype=np.float32),
                 np.empty((0,), dtype=np.float32),
                 np.empty((0,), dtype=np.float32),
             )
             self.tracker.update(wrapper)
+            # Reset consecutive counts on empty frame
+            for tid in list(self.consecutive_detection_count.keys()):
+                self.consecutive_detection_count[tid] = 0
 
-        # Clean up tracks unseen for 30 frames
-        stale_ids = [tid for tid, last_f in self.last_seen.items() if frame_idx - last_f > 30]
+        # Clean up stale tracks (tracks lost for more than 8 frames are removed)
+        stale_ids = [tid for tid, last_f in self.last_real_detection_frame.items() if frame_idx - last_f > 8]
         for tid in stale_ids:
             self.track_histories.pop(tid, None)
             self.ema_rates.pop(tid, None)
             self.last_seen.pop(tid, None)
+            self.last_real_detection_frame.pop(tid, None)
+            self.consecutive_detection_count.pop(tid, None)
+            if hasattr(self.tracker, "tracked_stracks"):
+                self.tracker.tracked_stracks = [t for t in self.tracker.tracked_stracks if int(t.track_id) != tid]
+            if hasattr(self.tracker, "lost_stracks"):
+                self.tracker.lost_stracks = [t for t in self.tracker.lost_stracks if int(t.track_id) != tid]
 
         self._last_active_dets = merged
-        return merged
+        self._last_tracker_frame = frame_idx
 
-    def _propagate_skipped_frame(self, frame_idx: int) -> List[Detection]:
-        """Propagate tracked boxes on skipped frames using BYTETracker Kalman state."""
+    def _step_tracker_forward(self, frame_idx: int) -> None:
+        """Fast-forward / propagate tracked boxes using BYTETracker Kalman state."""
         if hasattr(self.tracker, "multi_predict") and self.tracker.tracked_stracks:
             self.tracker.multi_predict(self.tracker.tracked_stracks)
 
@@ -364,12 +503,25 @@ class YOLODetector(ObstacleDetector):
 
         for old_d in self._last_active_dets:
             tid = old_d.tracker_id
+            # Propagated boxes older than 3 frames are dropped
+            age = frame_idx - self.last_real_detection_frame.get(tid, -999)
+            if age > 3:
+                continue
+
             t = track_map.get(tid)
             if t is not None and hasattr(t, "xyxy"):
                 coords = [float(v) for v in t.xyxy]
                 x1, y1, x2, y2 = int(round(coords[0])), int(round(coords[1])), int(round(coords[2])), int(round(coords[3]))
             else:
                 x1, y1, x2, y2 = old_d.x1, old_d.y1, old_d.x2, old_d.y2
+
+            # Clamp coordinates
+            if self._last_shape:
+                h, w = self._last_shape
+                x1, y1 = max(0, min(w - 1, x1)), max(0, min(h - 1, y1))
+                x2, y2 = max(0, min(w - 1, x2)), max(0, min(h - 1, y2))
+                if (x2 - x1) < 5 or (y2 - y1) < 5:
+                    continue
 
             new_d = Detection(
                 x1=x1,
@@ -382,9 +534,11 @@ class YOLODetector(ObstacleDetector):
                 kind=old_d.kind,
                 approach_rate=old_d.approach_rate,
                 tracker_id=tid,
+                last_update_frame=self.last_real_detection_frame.get(tid, old_d.last_update_frame),
+                consecutive_detections=self.consecutive_detection_count.get(tid, 0),
             )
 
-            # Update approach rate on skipped frame
+            # Update approach rate on propagated frame
             hist = self.track_histories[tid]
             hist.append(new_d.height)
             if len(hist) > 1:
@@ -394,11 +548,19 @@ class YOLODetector(ObstacleDetector):
                 self.ema_rates[tid] = rate
                 new_d.approach_rate = rate
 
-            self.last_seen[tid] = frame_idx
             prop_dets.append(new_d)
 
         self._last_active_dets = prop_dets
-        return prop_dets
+        self._last_tracker_frame = frame_idx
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        try:
+            self._worker_queue.put_nowait(None)
+        except Exception:
+            pass
+        if hasattr(self, "_worker_thread") and self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=2.0)
 
 
 class ThreadedDetector(ObstacleDetector):

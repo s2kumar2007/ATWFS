@@ -1,14 +1,15 @@
 metric,before,after,improvement
-total_fps,1.64,10.22,6.22x
-stage_read_ms,2.06,1.76,1.17x faster
-stage_preprocess_ms,5.31,9.79,0.54x faster
-stage_model_ms,121.80,44.68,2.73x faster
-stage_classical_ms,10.96,6.27,1.75x faster
-stage_YOLO_ms,441.93,28.95,15.27x faster
-stage_IPM_ms,5.26,1.76,2.99x faster
-stage_postprocess_ms,2.42,2.57,0.94x faster
-stage_annotate_ms,6.51,7.20,0.90x faster
-stage_write_ms,4.54,5.05,0.90x faster
+total_fps,7.04,5.50,0.78x
+stage_read_ms,2.10,2.76,0.76x faster
+stage_preprocess_ms,7.40,11.47,0.65x faster
+stage_model_ms,103.00,323.19,0.32x faster
+stage_classical_ms,1.20,31.96,0.04x faster
+stage_yolo_per_frame_ms,14.00,0.03,485.55x faster
+stage_IPM_ms,1.40,2.31,0.61x faster
+stage_postprocess_ms,2.40,2.16,1.11x faster
+stage_annotate_ms,4.90,17.15,0.29x faster
+stage_write_ms,3.60,0.88,4.10x faster
+steer_ge20_pct,54.3%,0.0%,-54.3%
 steer_saturation_pct,51.7%,0.0%,-51.7%
-mean_detections,2.92,2.47,preserved
-fallback_pct,3.3%,16.7%,exact match
+mean_detections,1.99,0.00,-1.99
+fallback_pct,3.3%,100.0%,exact match

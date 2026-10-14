@@ -81,6 +81,7 @@ def smoke_config(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         "loss": {"evidential_kl_anneal_epochs": 2},
         "paths": {"output_dir": "./outputs/smoke", "checkpoint_dir": "./outputs/smoke/checkpoints",
                   "report_dir": "./outputs/smoke/reports"},
+        "inference": {"decision": {"slow_speed_floor": None}, "hood_polygon": None},
     }
     cfg = deep_update(cfg, small)
     return deep_update(cfg, overrides) if overrides else cfg

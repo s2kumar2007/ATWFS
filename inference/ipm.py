@@ -116,72 +116,59 @@ class HorizonEstimator:
     def __init__(self, ema_alpha: float = 0.2) -> None:
         self.ema_alpha = float(ema_alpha)
         self.smoothed_vp_y: Optional[float] = None
+        self.success_count: int = 0
+        self.total_frames: int = 0
 
     def estimate_horizon_y(self, frame_bgr: np.ndarray, mask: Optional[np.ndarray] = None) -> Optional[float]:
         """Estimate the vanishing point vertical coordinate (horizon_y) in pixels."""
+        self.total_frames += 1
         h, w = frame_bgr.shape[:2]
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        
-        # Focus on lower 75% of the frame at half resolution for speed
-        roi_y1 = int(h * 0.25)
+
+        roi_y1 = int(h * 0.20)
         gray_roi = gray[roi_y1:, :]
-        half_w = max(1, w // 2)
-        half_roi_h = max(1, (h - roi_y1) // 2)
-        gray_half = cv2.resize(gray_roi, (half_w, half_roi_h), interpolation=cv2.INTER_AREA)
+        edges = cv2.Canny(gray_roi, 30, 90)
 
-        edges = cv2.Canny(gray_half, 50, 150)
-        if mask is not None:
-            m_half = cv2.resize(mask, (half_w, max(1, h // 2)), interpolation=cv2.INTER_NEAREST)[(roi_y1 // 2):, :]
-            dilated = cv2.dilate(m_half, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
-            if dilated.shape == edges.shape:
-                edges = cv2.bitwise_and(edges, edges, mask=dilated)
-
-        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=30, minLineLength=int(half_roi_h * 0.15), maxLineGap=15)
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=15, minLineLength=10, maxLineGap=15)
         if lines is None or len(lines) < 2:
             return self.smoothed_vp_y
 
         left_lines = []
         right_lines = []
         for line in lines:
-            pts = [float(v) * 2.0 for v in np.asarray(line).reshape(-1)[:4]]
-            x1, y1, x2, y2 = pts
+            pts = line.flatten()[:4]
+            x1, y1, x2, y2 = float(pts[0]), float(pts[1]), float(pts[2]), float(pts[3])
             dx = x2 - x1
             dy = y2 - y1
             if abs(dx) < 1e-4:
                 continue
             slope = dy / dx
             angle_deg = math.degrees(math.atan(slope))
-            # Plausible left lane line: negative angle between -75 and -20 deg
-            if -75 <= angle_deg <= -20:
+            # Plausible road lane boundaries
+            if -80 <= angle_deg <= -12:
                 left_lines.append((x1, y1 + roi_y1, x2, y2 + roi_y1))
-            # Plausible right lane line: positive angle between 20 and 75 deg
-            elif 20 <= angle_deg <= 75:
+            elif 12 <= angle_deg <= 80:
                 right_lines.append((x1, y1 + roi_y1, x2, y2 + roi_y1))
 
-        if not left_lines or not right_lines:
+        if len(left_lines) < 2 or len(right_lines) < 2:
             return self.smoothed_vp_y
 
-        # Average line coordinates
         def line_coeffs(lines_list):
             pts = np.array(lines_list, dtype=np.float32)
             fit = cv2.fitLine(pts.reshape(-1, 2), cv2.DIST_L2, 0, 0.01, 0.01).reshape(-1)
             vx, vy, x0, y0 = float(fit[0]), float(fit[1]), float(fit[2]), float(fit[3])
-            # Line equation: (y - y0) = (vy/vx)*(x - x0) -> vy*x - vx*y + (vx*y0 - vy*x0) = 0
-            a = float(vy)
-            b = float(-vx)
-            c = float(vx * y0 - vy * x0)
-            return a, b, c
+            return float(vy), float(-vx), float(vx * y0 - vy * x0)
 
         a1, b1, c1 = line_coeffs(left_lines)
         a2, b2, c2 = line_coeffs(right_lines)
 
         det = a1 * b2 - a2 * b1
-        if abs(det) < 1e-5:
+        if abs(det) < 1e-4:
             return self.smoothed_vp_y
 
         vp_y = (a2 * c1 - a1 * c2) / det
-        # Vanishing point must be reasonably in the upper-middle of the image
         if 0.1 * h <= vp_y <= 0.8 * h:
+            self.success_count += 1
             if self.smoothed_vp_y is None:
                 self.smoothed_vp_y = float(vp_y)
             else:
@@ -195,7 +182,7 @@ class InversePerspectiveMapping:
 
     def __init__(self, cfg: Dict[str, Any]) -> None:
         self.cfg = cfg
-        cam = cfg.get("camera", {})
+        cam = cfg.get("camera", cfg) if isinstance(cfg, dict) else {}
         self.height_m = float(cam.get("height_m", 1.3))
         self.nominal_pitch_deg = float(cam.get("pitch_deg", 0.0))
         self.nominal_roll_deg = float(cam.get("roll_deg", 0.0))
@@ -415,7 +402,13 @@ class InversePerspectiveMapping:
             bev_mask = self.warp_mask_to_bev(mask, H_img2bev)
             lookahead_m = float(getattr(self, "bev_lookahead_m", 6.0))
             width_m, offset_m = self.extract_road_metrics(bev_mask, distance_m=lookahead_m)
-            valid = (width_m is not None and width_m > 1.0)
+            horizon_ok = (method in ("imu_fused", "horizon_only"))
+            if width_m is not None and (width_m < 2.5 or not horizon_ok):
+                width_m = None
+                valid = False
+            else:
+                valid = (width_m is not None and width_m >= 2.5)
+
             return IPMResult(
                 bev_mask=bev_mask,
                 homography=H_img2bev,
@@ -424,7 +417,7 @@ class InversePerspectiveMapping:
                 road_width_m=width_m,
                 lateral_offset_m=offset_m,
                 method=method,
-                valid=valid
+                valid=valid,
             )
         except Exception:
             return IPMResult(

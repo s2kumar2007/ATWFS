@@ -186,25 +186,7 @@ inference:
   input_size:
   - 288
   - 512
-  hood_polygon:
-  - - 0.0
-    - 1.0
-  - - 0.05
-    - 0.88
-  - - 0.15
-    - 0.75
-  - - 0.32
-    - 0.64
-  - - 0.5
-    - 0.59
-  - - 0.68
-    - 0.64
-  - - 0.85
-    - 0.75
-  - - 0.95
-    - 0.88
-  - - 1.0
-    - 1.0
+  hood_polygon: null
   colors:
     drivable:
     - 30
@@ -302,7 +284,7 @@ inference:
       - 512
     cpu:
       detector_weights: yolov8n.pt
-      detector_imgsz: 640
+      detector_imgsz: 480
       detector_every_n: 4
       crop_every_n: 0
       crop_upscale: 1.0
@@ -316,6 +298,7 @@ inference:
   decision:
     max_steer_deg: 30.0
     v_max: 1.5
+    slow_speed_floor: 0.3
     trust_min: 0.3
     width_ref: 0.35
     lookahead_rows:

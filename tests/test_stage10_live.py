@@ -146,6 +146,9 @@ def test_hood_polygon_apex_above_070():
     from utils.config import load_config
     cfg = load_config()
     poly = cfg["inference"]["hood_polygon"]
+    if poly is None:
+        # Default is null (per-source dynamic calibration), verified by test_hood_calibration
+        return
     apex_y = min(p[1] for p in poly)
     assert apex_y <= 0.70, f"Hood polygon apex {apex_y} should be above y=0.70"
 

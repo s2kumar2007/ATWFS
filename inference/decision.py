@@ -142,11 +142,20 @@ def compute_command(
     road_width_m: Optional[float] = None,
     lateral_offset_m: Optional[float] = None,
     prev_angle: Optional[float] = None,
+    hold_count: int = 0,
+    prev_speed: Optional[float] = None,
 ) -> Command:
     h, w = mask.shape
 
     nz_y, nz_x = np.nonzero(mask)
     if len(nz_y) == 0:
+        if prev_angle is not None and hold_count < 5:
+            held = float(prev_angle)
+            return Command(
+                angle=held, speed=0.0, trust=trust, obstacle_flag=False, width_frac=0.0,
+                centroid_x=w / 2.0, obstacle_proximity=0.0, width_m=road_width_m, offset_m=lateral_offset_m,
+                heading_error_deg=0.0, raw_angle_deg=held, clamped_angle_deg=held, saturating_term="hold_angle",
+            )
         return Command(0.0, 0.0, trust, False, 0.0, w / 2.0, 0.0, width_m=road_width_m, offset_m=lateral_offset_m)
 
     bottom_y = int(np.max(nz_y))
@@ -168,6 +177,16 @@ def compute_command(
         ego_window_half_m=float(cfg.get("ego_window_half_m", 1.8)),
     )
 
+    # If ego-lane corridor in lookahead band is missing, hold angle for up to 5 frames
+    if img_run_width_m <= 0.0 and (road_width_m is None or road_width_m < 1.0):
+        if prev_angle is not None and hold_count < 5:
+            held = float(prev_angle)
+            return Command(
+                angle=held, speed=0.0, trust=trust, obstacle_flag=False, width_frac=0.0,
+                centroid_x=cx, obstacle_proximity=0.0, width_m=road_width_m, offset_m=lateral_offset_m,
+                heading_error_deg=0.0, raw_angle_deg=held, clamped_angle_deg=held, saturating_term="hold_angle",
+            )
+
     # Width fraction at row just above hood
     row_idx = max(0, bottom_y - 5)
     row_nz = np.nonzero(mask[row_idx])[0]
@@ -182,13 +201,13 @@ def compute_command(
     wheelbase_m = float(cfg.get("wheelbase_m", 2.5))
     max_steer = float(cfg.get("max_steer_deg", 30.0))
 
-    # Only use IPM lateral_offset_m if road_width_m is valid (>1.0m)
+    # Only use IPM lateral_offset_m if road_width_m is valid (>= 2.5m)
     use_ipm_offset = (
         lateral_offset_m is not None
-        and (road_width_m is None or road_width_m >= 1.0)
+        and (road_width_m is not None and road_width_m >= 2.5)
     )
     eff_offset_m = float(lateral_offset_m) if use_ipm_offset else float(img_offset_m)
-    eff_width_m = road_width_m if (road_width_m is not None and road_width_m >= 1.0) else img_run_width_m
+    eff_width_m = road_width_m if (road_width_m is not None and road_width_m >= 2.5) else img_run_width_m
 
     heading_err_deg, raw_angle_deg = pure_pursuit_angle_deg(eff_offset_m, lookahead_m, wheelbase_m)
     clamped_angle_deg = max(-max_steer, min(max_steer, raw_angle_deg))
@@ -210,47 +229,72 @@ def compute_command(
     else:
         angle_deg = clamped_angle_deg
 
-    # Obstacle check
-    corridor = cfg["corridor_half_width"] * w
+    # Obstacle check: confirmed detection (>= 2 consecutive real detections), inside ego corridor, and close enough
+    corridor = float(cfg.get("corridor_half_width", 0.2)) * w
     obs_flag = False
     prox = 0.0
 
     for d in dets:
-        if abs(d.center_x - w / 2.0) < corridor:
-            rel_y = d.y2 / h
-            if rel_y > prox:
-                prox = rel_y
-            if rel_y > cfg["prox_slow"] or d.approach_rate > 1.05:
-                obs_flag = True
+        in_corridor = abs(d.center_x - w / 2.0) < corridor
+        rel_y = d.y2 / h
+        if in_corridor and rel_y > prox:
+            prox = rel_y
+
+        is_confirmed = (d.tracker_id is None) or (getattr(d, "consecutive_detections", 1) >= 2)
+        is_close_or_growing = (rel_y >= 0.55) or (d.approach_rate > 1.0)
+        if is_confirmed and in_corridor and is_close_or_growing:
+            obs_flag = True
 
     # Speed calculation
-    speed = float(cfg["v_max"])
-    if trust < cfg["trust_min"]:
-        speed = 0.0
+    v_max = float(cfg.get("v_max", 1.5))
+    has_slow_floor = ("slow_speed_floor" in cfg) and (cfg["slow_speed_floor"] is not None)
+    slow_floor = float(cfg.get("slow_speed_floor", 0.0) or 0.0)
 
-    speed *= cfg["terrain_speed_factor"][terrain]
+    speed = v_max
+    if trust < float(cfg.get("trust_min", 0.3)):
+        speed = slow_floor if has_slow_floor else 0.0
+
+    speed *= cfg.get("terrain_speed_factor", [1.0, 0.7, 0.5, 0.3])[terrain]
     speed *= max(0.5, trust)
 
     # Width handicap
-    if eff_width_m is not None and eff_width_m > 0:
+    if eff_width_m is not None and eff_width_m >= 2.5:
         ref_w = float(cfg.get("road_width_ref_m", 3.5))
         if eff_width_m < ref_w:
             speed *= max(0.3, eff_width_m / ref_w)
-    elif width_frac < cfg["width_ref"]:
-        speed *= max(0.3, width_frac / cfg["width_ref"])
+    elif width_frac < cfg.get("width_ref", 0.35):
+        speed *= max(0.3, width_frac / max(1e-4, cfg.get("width_ref", 0.35)))
 
     # Obstacle speed drop
     if obs_flag:
-        prox_stop = cfg["prox_stop"]
-        prox_slow = cfg["prox_slow"]
+        prox_stop = float(cfg.get("prox_stop", 0.85))
+        prox_slow = float(cfg.get("prox_slow", 0.55))
         factor = float(np.clip((prox_stop - prox) / max(0.01, prox_stop - prox_slow), 0.0, 1.0))
         speed *= factor
 
-        max_app = max([d.approach_rate for d in dets if abs(d.center_x - w / 2.0) < corridor] + [1.0])
-        if max_app > 1.05:
-            speed *= max(0.1, 1.0 - (max_app - 1.0) * 5.0)
+        confirmed_growing = [
+            d.approach_rate for d in dets
+            if abs(d.center_x - w / 2.0) < corridor and (
+                (d.tracker_id is None) or (getattr(d, "consecutive_detections", 1) >= 2)
+            )
+        ]
+        if confirmed_growing:
+            max_app = max(confirmed_growing)
+            if max_app > 1.05:
+                speed *= max(0.1, 1.0 - (max_app - 1.0) * 5.0)
 
-    if speed < 0.1:
+    # If no obstacle, speed floor ensures car doesn't stall on valid road
+    if not obs_flag and has_slow_floor and trust >= float(cfg.get("trust_min", 0.3)) and speed < slow_floor:
+        speed = slow_floor
+
+    # Ramp speed instead of stopping instantly
+    if prev_speed is not None:
+        max_ramp = float(cfg.get("max_speed_ramp", 0.15))
+        delta_v = speed - float(prev_speed)
+        delta_v = max(-max_ramp, min(max_ramp, delta_v))
+        speed = max(0.0, float(prev_speed) + delta_v)
+
+    if speed < 0.05:
         speed = 0.0
 
     return Command(
