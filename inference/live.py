@@ -100,12 +100,14 @@ class LivePipeline:
         # Low-light / night mode state
         night_cfg = cfg.get("inference", {}).get("night_mode", {})
         self.night_mode_enabled = bool(night_cfg.get("enabled", True))
-        self.night_thresh_low = float(night_cfg.get("threshold_low", 45.0))
-        self.night_thresh_high = float(night_cfg.get("threshold_high", 60.0))
-        self.night_debounce_frames = int(night_cfg.get("debounce_frames", 10))
+        self.night_thresh_low = float(night_cfg.get("threshold_low", 35.0))
+        self.night_thresh_high = float(night_cfg.get("threshold_high", 45.0))
+        self.night_debounce_frames = int(night_cfg.get("debounce_frames", 15))
         self.night_debounce_counter = 0
         self.current_mode = "day"
-        self._last_luma = 100.0
+        self._last_mean_luma = 100.0
+        self._last_p90_luma = 100.0
+        self.mode_switch_count = 0
 
         # Steering history for rate limiting and EMA
         self.prev_steer_angle: Optional[float] = None
@@ -168,28 +170,30 @@ class LivePipeline:
         else:
             apex_y = mh
 
-        # Night mode luma check on model-resolution image (every 5th frame)
+        # Whole-frame brightness check for night mode (mean < 35 and p90 < 65, debounce 15 frames)
         if self.night_mode_enabled:
             if (frame_idx % 5 == 0) or (self.night_debounce_counter > 0):
                 gray_small = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-                if self.prev_dl_mask is not None and np.count_nonzero(self.prev_dl_mask) > 50:
-                    self._last_luma = float(np.mean(gray_small[self.prev_dl_mask > 0]))
-                else:
-                    self._last_luma = float(np.mean(gray_small[int(nh * 0.50):int(nh * 0.70), int(nw * 0.30):int(nw * 0.70)]))
+                self._last_mean_luma = float(np.mean(gray_small))
+                self._last_p90_luma = float(np.percentile(gray_small, 90))
 
             if self.current_mode == "day":
-                if self._last_luma < self.night_thresh_low:
+                # Switch only if whole frame is dark
+                if self._last_mean_luma < 35.0 and self._last_p90_luma < 65.0:
                     self.night_debounce_counter += 1
                     if self.night_debounce_counter >= self.night_debounce_frames:
                         self.current_mode = "night"
+                        self.mode_switch_count += 1
                         self.night_debounce_counter = 0
                 else:
                     self.night_debounce_counter = 0
             else:
-                if self._last_luma > self.night_thresh_high:
+                # Hysteresis to switch back to day
+                if self._last_mean_luma >= 45.0 or self._last_p90_luma >= 80.0:
                     self.night_debounce_counter += 1
                     if self.night_debounce_counter >= self.night_debounce_frames:
                         self.current_mode = "day"
+                        self.mode_switch_count += 1
                         self.night_debounce_counter = 0
                 else:
                     self.night_debounce_counter = 0
@@ -293,7 +297,7 @@ class LivePipeline:
 
             alpha_val = self.fusion.alpha(unc, geo, tmp, terrain)
             if alpha_val < self.fallback_alpha_gate:
-                fb_mask_padded = self.classical.estimate(padded)
+                fb_mask_padded = self.classical.estimate(padded, horizon_y=int(0.25 * mh))
                 fb_mask = fb_mask_padded[pad_top:pad_top + nh, pad_left:pad_left + nw]
             else:
                 fb_mask = np.zeros_like(dl_mask)
@@ -324,6 +328,12 @@ class LivePipeline:
             hp_model_adj[:, 0] -= pad_left
             hp_model_adj[:, 1] -= pad_top
             cv2.fillPoly(mask, [hp_model_adj], 0)
+
+        # Mask reflective strip at bottom center of hood (x in [0.38, 0.65], y >= 0.91)
+        r_y1 = int(round(0.91 * nh))
+        r_x1 = int(round(0.38 * nw))
+        r_x2 = int(round(0.65 * nw))
+        mask[r_y1:, r_x1:r_x2] = 0
 
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
         if num_labels > 1:
@@ -568,29 +578,46 @@ def annotate(
     else:
         apex_p_y = p_h
 
-    # 3. Center path above the hood line
+    # 3. Center path above the hood line using polynomial x(y) = a*y^2 + b*y + c
     band = cfg.get("inference", {}).get("decision", {}).get("lookahead_rows", [0.55, 0.9])
     y_lookahead = int(band[0] * p_h)
     y_road_bottom = max(0, min(p_h - 1, apex_p_y - 2))
-
     visible_road_h = y_road_bottom - y_lookahead
-    if visible_road_h > 10 and p_mask[y_lookahead:y_road_bottom].any():
+    scale_px = float(w) / float(p_w)
+    scale_py = float(h) / float(p_h)
+
+    path_poly = getattr(res.command, "path_poly", None)
+    path_y_range = getattr(res.command, "path_y_range", None)
+    if path_poly is not None and path_y_range is not None and (path_y_range[1] - path_y_range[0]) > 10:
+        y_top, y_bot = path_y_range
+        a_p, b_p, c_p = path_poly
+        y_vals = np.linspace(y_bot, y_top, num=15, dtype=np.float32)
+        x_vals = a_p * (y_vals ** 2) + b_p * y_vals + c_p
+        pts = np.column_stack([x_vals * scale_px, y_vals * scale_py]).astype(np.float32)
+
+        ema_x = float(cfg.get("inference", {}).get("overlay", {}).get("ema_x", 0.35))
+        if "ema_pts" not in state or state["ema_pts"].shape != pts.shape:
+            state["ema_pts"] = pts
+        else:
+            state["ema_pts"] = ema_x * pts + (1.0 - ema_x) * state["ema_pts"]
+
+        p = state["ema_pts"].astype(np.int32)
+        cv2.polylines(out, [p], False, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+        cv2.polylines(out, [p], False, (0, 255, 255), thickness, cv2.LINE_AA)
+        cv2.arrowedLine(out, tuple(p[-2]), tuple(p[-1]), (0, 0, 0), thickness + 2, cv2.LINE_AA, tipLength=0.2)
+        cv2.arrowedLine(out, tuple(p[-2]), tuple(p[-1]), (0, 255, 255), thickness, cv2.LINE_AA, tipLength=0.2)
+    elif visible_road_h > 10 and p_mask[y_lookahead:y_road_bottom].any():
         c_pts = []
         step = max(1, visible_road_h // 10)
-        scale_px = float(w) / float(p_w)
-        scale_py = float(h) / float(p_h)
         ego_c = p_w / 2.0
-
         for y in range(y_road_bottom, y_lookahead - 1, -step):
             row = p_mask[y]
             nz = np.nonzero(row)[0]
             if len(nz) < 2:
                 continue
-
             diffs = np.diff(nz)
             split_pts = np.where(diffs > 1)[0] + 1
             runs = np.split(nz, split_pts)
-
             best_run = None
             min_dist = float("inf")
             for r in runs:
@@ -604,39 +631,22 @@ def annotate(
                 if d < min_dist:
                     min_dist = d
                     best_run = r
-
             if best_run is not None and len(best_run) > 0:
-                r_start, r_end = float(best_run[0]), float(best_run[-1])
-                run_w = r_end - r_start + 1.0
-                run_c = (r_start + r_end) / 2.0
-                max_w_px = 4.0 / max(1e-4, 10.0 / p_w)
-                if run_w > max_w_px:
-                    win_half = 1.8 / max(1e-4, 10.0 / p_w)
-                    target_x = float(np.clip(ego_c, r_start + win_half, r_end - win_half))
-                else:
-                    target_x = run_c
-
-                c_pts.append((target_x * scale_px, float(y) * scale_py))
+                run_c = (float(best_run[0]) + float(best_run[-1])) / 2.0
+                c_pts.append((run_c * scale_px, float(y) * scale_py))
 
         if len(c_pts) >= 3:
             pts = np.array(c_pts, dtype=np.float32)
-            path_vert_span = abs(pts[0, 1] - pts[-1, 1])
-
-            # Requirement: A path shorter than 25% of the visible road height must not be drawn
-            if path_vert_span >= 0.25 * (visible_road_h * scale_py):
-                ema_x = float(cfg.get("inference", {}).get("overlay", {}).get("ema_x", 0.35))
-                if "ema_pts" not in state or state["ema_pts"].shape != pts.shape:
-                    state["ema_pts"] = pts
-                else:
-                    state["ema_pts"] = ema_x * pts + (1.0 - ema_x) * state["ema_pts"]
-
-                p = state["ema_pts"].astype(np.int32)
-                cv2.polylines(out, [p], False, (0, 0, 0), thickness + 2, cv2.LINE_AA)
-                cv2.polylines(out, [p], False, (0, 255, 255), thickness, cv2.LINE_AA)
-                cv2.arrowedLine(out, tuple(p[-2]), tuple(p[-1]), (0, 0, 0), thickness + 2, cv2.LINE_AA, tipLength=0.2)
-                cv2.arrowedLine(out, tuple(p[-2]), tuple(p[-1]), (0, 255, 255), thickness, cv2.LINE_AA, tipLength=0.2)
+            ema_x = float(cfg.get("inference", {}).get("overlay", {}).get("ema_x", 0.35))
+            if "ema_pts" not in state or state["ema_pts"].shape != pts.shape:
+                state["ema_pts"] = pts
             else:
-                state.pop("ema_pts", None)
+                state["ema_pts"] = ema_x * pts + (1.0 - ema_x) * state["ema_pts"]
+            p = state["ema_pts"].astype(np.int32)
+            cv2.polylines(out, [p], False, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+            cv2.polylines(out, [p], False, (0, 255, 255), thickness, cv2.LINE_AA)
+            cv2.arrowedLine(out, tuple(p[-2]), tuple(p[-1]), (0, 0, 0), thickness + 2, cv2.LINE_AA, tipLength=0.2)
+            cv2.arrowedLine(out, tuple(p[-2]), tuple(p[-1]), (0, 255, 255), thickness, cv2.LINE_AA, tipLength=0.2)
         else:
             state.pop("ema_pts", None)
     else:
@@ -656,9 +666,10 @@ def annotate(
         elif d.kind == "animal":
             color = c_animal
         else:
-            if res.command.obstacle_flag and res.command.obstacle_proximity > 0 and d.approach_rate > 1.0:
+            is_threat = (d.y2 / float(h) >= 0.55) or getattr(d, "sustained_growth", False)
+            if res.command.obstacle_flag and is_threat and (abs(d.center_x - w / 2.0) < corridor_hw):
                 color = c_veh_obs
-            elif d.approach_rate > 1.05 or abs(d.center_x - w / 2.0) < corridor_hw:
+            elif getattr(d, "sustained_growth", False):
                 color = c_veh_app
             else:
                 color = c_veh_def
@@ -854,6 +865,7 @@ class WriterWorker(threading.Thread):
         total_frames: Optional[int],
         cfg: Dict[str, Any],
         errors: List[BaseException],
+        out_dir: Optional[Path] = None,
     ) -> None:
         super().__init__(daemon=True)
         self.in_q = in_q
@@ -866,6 +878,7 @@ class WriterWorker(threading.Thread):
         self.total_frames = total_frames
         self.cfg = cfg
         self.errors = errors
+        self.out_dir = out_dir if out_dir is not None else out_path.parent
         self.writer: Optional[cv2.VideoWriter] = None
         self.actual_out_path = out_path
         self.annot_state: Dict[str, Any] = {}
@@ -876,15 +889,19 @@ class WriterWorker(threading.Thread):
 
     def run(self) -> None:
         try:
-            check_frame_names = {
-                0: "frame_01_idx0.jpg",
-                242: "frame_02_idx242.jpg",
-                484: "frame_03_idx484.jpg",
-                726: "frame_04_idx726.jpg",
-                968: "frame_05_idx968.jpg",
-                1210: "frame_06_idx1210.jpg",
-                1452: "frame_07_idx1452.jpg",
-                1695: "frame_08_idx1695.jpg",
+            check_frame_indices = {
+                1: "frame_01_idx1.jpg",
+                51: "frame_02_idx51.jpg",
+                101: "frame_03_idx101.jpg",
+                151: "frame_04_idx151.jpg",
+                201: "frame_05_idx201.jpg",
+                251: "frame_06_idx251.jpg",
+                484: "frame_07_idx484.jpg",
+                726: "frame_08_idx726.jpg",
+                968: "frame_09_idx968.jpg",
+                1210: "frame_10_idx1210.jpg",
+                1452: "frame_11_idx1452.jpg",
+                1695: "frame_12_idx1695.jpg",
             }
             while not self.stop.is_set():
                 item = self.in_q.get()
@@ -910,11 +927,11 @@ class WriterWorker(threading.Thread):
                 self.p.timings["annotate"] += t_ann_ms / 1000.0
                 self.p.stage_samples["annotate"].append(t_ann_ms)
 
-                # Export check frame if matching index
-                if idx in check_frame_names:
-                    cf_dir = Path("outputs/inference/check_frames_after")
+                # Export reference check frames to check_frames_v3
+                if idx in check_frame_indices:
+                    cf_dir = self.out_dir / "check_frames_v3"
                     cf_dir.mkdir(parents=True, exist_ok=True)
-                    cv2.imwrite(str(cf_dir / check_frame_names[idx]), ann_frame)
+                    cv2.imwrite(str(cf_dir / check_frame_indices[idx]), ann_frame)
 
                 # Write
                 t_w0 = time.perf_counter()
@@ -984,7 +1001,14 @@ def run_video(
     use_int8: bool = False,
     backend: Optional[str] = None,
     seg_every: Optional[int] = None,
+    out_dir: Optional[Union[str, Path]] = None,
 ) -> Dict[str, Any]:
+    if out_dir is not None:
+        out_dir_path = Path(out_dir)
+    else:
+        out_dir_path = Path(output_path).parent
+    out_dir_path.mkdir(parents=True, exist_ok=True)
+
     # Safeguard check on basename
     if isinstance(source, str) and not force:
         base_lower = Path(source).name.lower()
@@ -1159,7 +1183,7 @@ def run_video(
     worker = InferenceWorker(pipeline, frame_q, result_q, stop, inf["frame_skip"], errors, grabber.total_frames, imu_reader=imu_reader)
     writer_worker = WriterWorker(
         result_q, packet_q, stop, pipeline, grabber.fps, Path(output_path), inf["video_fourcc"],
-        grabber.total_frames, cfg, errors,
+        grabber.total_frames, cfg, errors, out_dir=out_dir_path,
     )
 
     grabber.start()
@@ -1170,7 +1194,7 @@ def run_video(
     serial_sender = SerialSender(port=serial_port, baud=serial_baud, dry_run=serial_dry_run) if (serial_port or serial_dry_run) else None
 
     # Steer debug CSV
-    steer_debug_dir = Path("outputs/inference")
+    steer_debug_dir = out_dir_path
     steer_debug_dir.mkdir(parents=True, exist_ok=True)
     steer_debug_f = open(steer_debug_dir / "steer_debug.csv", "w", newline="", encoding="utf-8")
     steer_debug_writer = csv.writer(steer_debug_f)
@@ -1197,6 +1221,11 @@ def run_video(
     t_last_frame = time.perf_counter()
     sat_20_count = 0
     sat_29_count = 0
+    steer_zero_count = 0
+    sign_agree_count = 0
+    zero_det_count = 0
+    zero_det_frames: List[int] = []
+    obs_frames: List[int] = []
 
     try:
         while True:
@@ -1220,8 +1249,19 @@ def run_video(
                 alpha_below_thr_count += 1
             if res.command.obstacle_flag:
                 obstacle_count += 1
+                obs_frames.append(idx)
             det_count += len(res.detections)
+            if len(res.detections) == 0:
+                zero_det_count += 1
+                zero_det_frames.append(idx)
             trust_list.append(res.command.trust)
+
+            if abs(res.command.angle) < 1e-3:
+                steer_zero_count += 1
+            dx = getattr(res.command, "lateral_target_dx", 0.0)
+            ang = res.command.angle
+            if (dx > 0 and ang > 0) or (dx < 0 and ang < 0) or (abs(dx) <= 0.5 and abs(ang) <= 0.5) or (abs(dx) < 1e-3 and abs(ang) < 1e-3):
+                sign_agree_count += 1
 
             if abs(res.command.angle) >= 20.0:
                 sat_20_count += 1
@@ -1353,13 +1393,22 @@ def run_video(
 
     p95_fps = float(np.percentile(list(fps_q), 5)) if len(fps_q) > 0 else avg_fps
 
+    steer_zero_pct = (steer_zero_count / total_pkts) * 100.0
+    sign_agree_pct = (sign_agree_count / total_pkts) * 100.0
+    zero_det_pct = (zero_det_count / total_pkts) * 100.0
+    mode_switches = getattr(pipeline, "mode_switch_count", 0)
+
     print(f"Average FPS: {avg_fps:.2f} (P95 FPS: {p95_fps:.2f})")
     print(f"Trust (min/mean/max): {t_min:.3f} / {t_mean:.3f} / {t_max:.3f}")
     print(f"FALLBACK frames: {fb_pct:.1f}% (alpha < thr: {alpha_below_pct:.1f}%)")
-    print(f"Obstacle Flag frames: {obs_pct:.1f}%")
+    print(f"Obstacle Flag frames: {obs_pct:.1f}% ({len(obs_frames)} frames: {obs_frames[:15]}...)")
     print(f"Mean Detections/frame: {mean_dets:.2f}")
+    print(f"Frames with 0 detections: {zero_det_pct:.1f}% ({zero_det_count}/{total_pkts} frames: {zero_det_frames[:15]}...)")
+    print(f"Steering == 0.0 deg: {steer_zero_pct:.1f}% ({steer_zero_count}/{total_pkts} frames)")
     print(f"Steering (|angle| >= 20.0 deg): {sat_20_pct:.1f}%")
     print(f"Steering saturation (|angle| >= 29.5 deg): {sat_29_pct:.1f}%")
+    print(f"Path/Steer sign agreement: {sign_agree_pct:.1f}%")
+    print(f"Mode switches: {mode_switches} (Current: {pipeline.current_mode})")
 
     # Baseline comparison (user prompt specifies 300-frame cpu-profile run as baseline:
     # 7.04 FPS, model 103 ms, YOLO 14 ms, 1.99 detections per frame)
@@ -1408,8 +1457,8 @@ def run_video(
         w.writerow(["mean_detections", f"{b_data.get('mean_detections', 1.99):.2f}", f"{mean_dets:.2f}", f"{mean_dets - b_data.get('mean_detections', 1.99):+.2f}"])
         w.writerow(["fallback_pct", f"{b_data.get('fallback_pct', 3.3):.1f}%", f"{fb_pct:.1f}%", "exact match"])
 
-    # Write run_summary.txt
-    summary_path = Path("outputs/inference/run_summary.txt")
+    # Write run_summary.txt to out_dir_path
+    summary_path = out_dir_path / "run_summary.txt"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_lines = [
         "=================================================================",
@@ -1427,8 +1476,12 @@ def run_video(
         f"FALLBACK frames:    {fb_pct:.1f}% (Baseline: {b_data.get('fallback_pct', 3.3):.1f}%)",
         f"Obstacle Flag:      {obs_pct:.1f}% (Baseline: {b_data.get('obstacle_flag_pct', 50.0):.1f}%)",
         f"Detections / Frame: {mean_dets:.2f} (Baseline: {b_data.get('mean_detections', 1.99):.2f})",
+        f"Frames 0 Detections: {zero_det_pct:.1f}% ({zero_det_count}/{total_pkts})",
+        f"Steering == 0.0 deg: {steer_zero_pct:.1f}% ({steer_zero_count}/{total_pkts})",
         f"Steering (|angle| >= 20 deg): {sat_20_pct:.1f}% (Baseline: {b_data.get('steer_ge20_pct_before', 54.3):.1f}%)",
         f"Steering Saturation (|angle| >= 29.5 deg): {sat_29_pct:.1f}% (Baseline: {b_data.get('steer_saturation_pct_before', 51.7):.1f}%)",
+        f"Path/Steer Sign Agreement: {sign_agree_pct:.1f}%",
+        f"Mode Switches:      {mode_switches} (Current: {pipeline.current_mode})",
         "-----------------------------------------------------------------",
         "PER-STAGE TIMINGS TABLE (ms):",
         f"{'Stage':<20} | {'Mean (ms)':<10} | {'P95 (ms)':<10} | {'Total (s)':<10}",
@@ -1489,6 +1542,7 @@ def main() -> None:
     ap.add_argument("--int8", action="store_true", help="Use INT8 quantized ONNX model")
     ap.add_argument("--backend", choices=["torch", "onnx", "openvino"], default=None, help="Execution backend")
     ap.add_argument("--seg-every", type=int, default=None, help="Run segmentation every Nth frame")
+    ap.add_argument("--out-dir", default=None, help="Directory for output reports and frames")
     a = ap.parse_args()
 
     setup_logging()
@@ -1523,6 +1577,7 @@ def main() -> None:
         use_int8=a.int8,
         backend=a.backend,
         seg_every=a.seg_every,
+        out_dir=a.out_dir,
     )
 
 

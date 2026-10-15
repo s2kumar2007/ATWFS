@@ -41,6 +41,7 @@ class Detection:
     tracker_id: Optional[int] = None
     last_update_frame: int = 0
     consecutive_detections: int = 1
+    sustained_growth: bool = False
 
     @property
     def height(self) -> int:
@@ -133,20 +134,22 @@ class YOLODetector(ObstacleDetector):
         self.use_tensorrt = use_tensorrt or cfg.get("tensorrt", False)
         self.model = self._load_yolo_model(weights_path, YOLO)
 
-        self.conf = float(cfg.get("conf", 0.25))
+        self.conf = float(cfg.get("conf", 0.20))
         self.iou = float(cfg.get("iou", 0.5))
         self.agnostic_nms = bool(cfg.get("agnostic_nms", True))
         self.allowed_classes: Set[int] = set(cfg.get("class_ids", [0, 1, 2, 3, 5, 7, 16, 17, 18, 19]))
 
         th = cfg.get("conf_thresholds", {})
-        self.thr_person = float(th.get("person", 0.25))
-        self.thr_vehicle = float(th.get("vehicle", 0.25))
+        self.thr_person = float(th.get("person", 0.20))
+        self.thr_vehicle = float(th.get("vehicle", 0.20))
         self.thr_animal = float(th.get("animal", 0.30))
 
         self.imgsz = int(cfg.get("imgsz", 960 if self.device_type == "cuda" else 640))
         self.crop_every_n = int(cfg.get("crop_every_n", 6 if self.device_type == "cuda" else 0))
         self.crop_upscale = float(cfg.get("crop_upscale", 2.0 if self.device_type == "cuda" else 1.0))
         self.every_n = max(1, int(cfg.get("every_n", 1)))
+        self.latency_frames = int(cfg.get("latency_frames", 2 if self.every_n == 1 else 4))
+        self.expiry_frames = int(cfg.get("expiry_frames", self.every_n + self.latency_frames))
 
         # Standalone BYTETracker setup
         tracker_args = SimpleNamespace(
@@ -374,44 +377,53 @@ class YOLODetector(ObstacleDetector):
             )
         self._last_shape = (h, w)
 
-        # 1. Drain newly completed active pass results from worker
-        received_new_result = False
-        while not self._result_queue.empty():
-            try:
-                res_idx, res_dets, active_ms = self._result_queue.get_nowait()
-                self.active_pass_samples.append(active_ms)
-                # Update tracker with newly arrived detections at res_idx
-                self._update_tracker_with_dets(res_dets, res_idx)
-                # Fast-forward tracker from res_idx + 1 up to current frame_idx
-                for ff_idx in range(res_idx + 1, frame_idx + 1):
-                    self._step_tracker_forward(ff_idx)
-                received_new_result = True
-            except queue.Empty:
-                break
-
-        # 2. Trigger worker on cadence if worker is idle
-        if frame_idx % self.every_n == 0:
-            if not self._worker_busy.is_set():
-                self._worker_busy.set()
+        # 0. Frame 0 / scene start synchronous detection pass
+        if self._last_tracker_frame is None:
+            t_sync0 = time.perf_counter()
+            dets0 = self._run_active_pass(bgr, frame_idx)
+            sync_ms = (time.perf_counter() - t_sync0) * 1000.0
+            self.active_pass_samples.append(sync_ms)
+            self._update_tracker_with_dets(dets0, frame_idx)
+            received_new_result = True
+        else:
+            received_new_result = False
+            # 1. Drain newly completed active pass results from worker
+            while not self._result_queue.empty():
                 try:
-                    self._worker_queue.put_nowait((bgr.copy(), frame_idx))
-                except queue.Full:
-                    self._worker_busy.clear()
+                    res_idx, res_dets, active_ms = self._result_queue.get_nowait()
+                    self.active_pass_samples.append(active_ms)
+                    # Update tracker with newly arrived detections at res_idx
+                    self._update_tracker_with_dets(res_dets, res_idx)
+                    # Fast-forward tracker from res_idx + 1 up to current frame_idx
+                    for ff_idx in range(res_idx + 1, frame_idx + 1):
+                        self._step_tracker_forward(ff_idx)
+                    received_new_result = True
+                except queue.Empty:
+                    break
 
-        # 3. If no new result was received or tracker needs propagation to current frame
-        if not received_new_result:
-            if self._last_tracker_frame is None or self._last_tracker_frame < frame_idx:
-                start_f = frame_idx if self._last_tracker_frame is None else self._last_tracker_frame + 1
-                for f in range(start_f, frame_idx + 1):
-                    self._step_tracker_forward(f)
+            # 2. Trigger worker on cadence if worker is idle
+            if frame_idx % self.every_n == 0:
+                if not self._worker_busy.is_set():
+                    self._worker_busy.set()
+                    try:
+                        self._worker_queue.put_nowait((bgr.copy(), frame_idx))
+                    except queue.Full:
+                        self._worker_busy.clear()
+
+            # 3. If no new result was received or tracker needs propagation to current frame
+            if not received_new_result:
+                if self._last_tracker_frame is None or self._last_tracker_frame < frame_idx:
+                    start_f = frame_idx if self._last_tracker_frame is None else self._last_tracker_frame + 1
+                    for f in range(start_f, frame_idx + 1):
+                        self._step_tracker_forward(f)
 
         t_ms = (time.perf_counter() - t0) * 1000.0
         self.overhead_samples.append(t_ms)
-        # Every box drawn or used for decisions must come from a detection or tracker update within the last 3 frames;
+        # Every box drawn or used for decisions must come from a detection or tracker update within expiry_frames;
         # Never draw a box that hasn't been updated.
         valid_dets = [
             d for d in self._last_active_dets
-            if (frame_idx - self.last_real_detection_frame.get(d.tracker_id, -999)) <= 3
+            if (frame_idx - self.last_real_detection_frame.get(d.tracker_id, -999)) <= self.expiry_frames
         ]
         return list(valid_dets)
 
@@ -462,6 +474,8 @@ class YOLODetector(ObstacleDetector):
                 else:
                     d.approach_rate = self.ema_rates.get(tid, 1.0)
 
+                d.sustained_growth = (len(hist) >= 5) and ((d.height / max(1.0, float(hist[0]))) > 1.12)
+
             # Reset consecutive count for tracks not detected in this pass
             for tid in list(self.consecutive_detection_count.keys()):
                 if tid not in active_tids:
@@ -477,8 +491,9 @@ class YOLODetector(ObstacleDetector):
             for tid in list(self.consecutive_detection_count.keys()):
                 self.consecutive_detection_count[tid] = 0
 
-        # Clean up stale tracks (tracks lost for more than 8 frames are removed)
-        stale_ids = [tid for tid, last_f in self.last_real_detection_frame.items() if frame_idx - last_f > 8]
+        # Clean up stale tracks (tracks lost for more than expiry_frames + 2 frames are removed)
+        max_stale = max(8, self.expiry_frames + 2)
+        stale_ids = [tid for tid, last_f in self.last_real_detection_frame.items() if frame_idx - last_f > max_stale]
         for tid in stale_ids:
             self.track_histories.pop(tid, None)
             self.ema_rates.pop(tid, None)
@@ -503,9 +518,9 @@ class YOLODetector(ObstacleDetector):
 
         for old_d in self._last_active_dets:
             tid = old_d.tracker_id
-            # Propagated boxes older than 3 frames are dropped
+            # Propagated boxes older than expiry_frames are dropped
             age = frame_idx - self.last_real_detection_frame.get(tid, -999)
-            if age > 3:
+            if age > self.expiry_frames:
                 continue
 
             t = track_map.get(tid)
@@ -536,6 +551,7 @@ class YOLODetector(ObstacleDetector):
                 tracker_id=tid,
                 last_update_frame=self.last_real_detection_frame.get(tid, old_d.last_update_frame),
                 consecutive_detections=self.consecutive_detection_count.get(tid, 0),
+                sustained_growth=old_d.sustained_growth,
             )
 
             # Update approach rate on propagated frame
@@ -547,6 +563,7 @@ class YOLODetector(ObstacleDetector):
                 rate = 0.3 * raw_rate + 0.7 * prev_rate
                 self.ema_rates[tid] = rate
                 new_d.approach_rate = rate
+            new_d.sustained_growth = (len(hist) >= 5) and ((new_d.height / max(1.0, float(hist[0]))) > 1.12)
 
             prop_dets.append(new_d)
 

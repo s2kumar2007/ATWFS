@@ -8,3 +8,7 @@ outputs/weights/
 *.pt
 *.mp4
 outputs/inference/*.csv
+outputs/inference/*.mp4
+outputs/inference/run_summary.txt
+outputs/inference/check_frames_after/
+outputs/inference/check_frames_v3/

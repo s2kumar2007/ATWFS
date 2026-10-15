@@ -44,11 +44,12 @@ class ClassicalFreeSpaceEstimator:
         cv2.fillPoly(m, [pts.astype(np.int32)], 1)
         return m
 
-    def estimate(self, bgr: np.ndarray) -> np.ndarray:
+    def estimate(self, bgr: np.ndarray, horizon_y: Optional[int] = None) -> np.ndarray:
         """Estimate the free-space mask.
 
         Args:
             bgr: ``(H, W, 3)`` uint8 BGR frame.
+            horizon_y: Optional row index of horizon. If None, derived from config.
 
         Returns:
             ``(H, W)`` uint8 binary mask (1 = free/drivable); may be all zeros if nothing plausible is found.
@@ -66,7 +67,20 @@ class ClassicalFreeSpaceEstimator:
         if c["edge_dilate"] > 0:
             edges = cv2.dilate(edges, np.ones((2 * c["edge_dilate"] + 1,) * 2, np.uint8))
         free &= edges == 0
-        free[: int(c["horizon_frac"] * h)] = False
+
+        eff_horizon = horizon_y if horizon_y is not None else int(c.get("horizon_frac", 0.25) * h)
+        free[: max(0, eff_horizon)] = False
+
+        # Road perspective ROI trapezoid: restricts candidate pixels to inside road bounds
+        roi_pts = np.array([
+            [int(0.15 * w), eff_horizon],
+            [int(0.85 * w), eff_horizon],
+            [w, h],
+            [0, h],
+        ], dtype=np.int32)
+        roi_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(roi_mask, [roi_pts], 1)
+        free &= (roi_mask > 0)
         k = np.ones((c["morph_kernel"],) * 2, np.uint8)
         free_u8 = cv2.morphologyEx(free.astype(np.uint8), cv2.MORPH_CLOSE, k)
         free_u8 = cv2.morphologyEx(free_u8, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))

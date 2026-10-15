@@ -1,31 +1,36 @@
 =================================================================
-ATWFS INFERENCE RUN SUMMARY (7 FRAMES PROCESSED)
+ATWFS INFERENCE RUN SUMMARY (300 FRAMES PROCESSED)
 =================================================================
 Backend:            onnx
-Device:             cpu
+Device:             ONNX Runtime (student_best.onnx)
 Profile:            cpu
 Segmentation Rate:  Every 1 frame(s)
 Detector Cadence:   Every 4 frames (yolov8n.pt @ imgsz 480)
 -----------------------------------------------------------------
-Average FPS:        5.50 (Baseline: 7.04)
-P95 FPS:            2.31 (Baseline: 6.80)
-Trust (min/mean/max): 0.052 / 0.055 / 0.066 (Baseline: 0.279 / 0.760 / 0.921)
-FALLBACK frames:    100.0% (Baseline: 3.3%)
-Obstacle Flag:      0.0% (Baseline: 50.0%)
-Detections / Frame: 0.00 (Baseline: 1.99)
-Steering (|angle| >= 20 deg): 0.0% (Baseline: 54.3%)
+Average FPS:        7.22 (Baseline: 7.04)
+P95 FPS:            1.63 (Baseline: 6.80)
+Trust (min/mean/max): 0.049 / 0.621 / 0.928 (Baseline: 0.279 / 0.760 / 0.921)
+FALLBACK frames:    22.3% (Baseline: 3.3%)
+Obstacle Flag:      12.3% (Baseline: 50.0%)
+Detections / Frame: 2.19 (Baseline: 1.99)
+Frames 0 Detections: 0.0% (0/300)
+Steering == 0.0 deg: 0.0% (0/300)
+Steering (|angle| >= 20 deg): 7.3% (Baseline: 54.3%)
 Steering Saturation (|angle| >= 29.5 deg): 0.0% (Baseline: 51.7%)
+Path/Steer Sign Agreement: 100.0%
+Mode Switches:      0 (Current: day)
 -----------------------------------------------------------------
 PER-STAGE TIMINGS TABLE (ms):
 Stage                | Mean (ms)  | P95 (ms)   | Total (s) 
 -----------------------------------------------------------------
-read                 | 2.76       | 11.11      | 0.02      
-preprocess           | 11.47      | 13.27      | 0.03      
-model                | 323.19     | 338.63     | 0.97      
-classical            | 31.96      | 32.35      | 0.10      
-YOLO (per-frame)     | 0.03       | 0.04       | 0.00      
-IPM                  | 2.31       | 4.63       | 0.01      
-postprocess          | 2.16       | 3.02       | 0.01      
-annotate             | 17.15      | 62.77      | 0.12      
-write                | 0.88       | 2.51       | 0.01      
+read                 | 2.92       | 4.90       | 0.88      
+preprocess           | 12.22      | 33.42      | 3.67      
+model                | 95.16      | 364.03     | 28.55     
+classical            | 14.32      | 81.51      | 4.30      
+YOLO (per-frame)     | 1.56       | 3.78       | 0.47      
+IPM                  | 3.17       | 19.12      | 0.95      
+postprocess          | 4.40       | 12.28      | 1.32      
+annotate             | 16.82      | 61.62      | 5.04      
+write                | 7.89       | 20.12      | 2.37      
+YOLO (active pass)   | 179.45     | 676.45     | 13.46     
 =================================================================
