@@ -3,8 +3,10 @@
 Features:
 - Ego-lane contiguous run selection with +/-1.8m window on wide multi-lane roads (>4.0m)
 - Pure pursuit steering angle: ``atan(2 * wheelbase * sin(alpha) / lookahead)``
+- Fixed metric lookahead (default 4.0 m) evaluated at the corresponding image row
 - Exponential moving average (EMA) smoothing and per-frame angular rate limiting
 - Obstacle footprint subtraction and proximity/approach-rate speed decay
+- Low-visibility: hold angle 5 frames then decay, crawl rather than stop
 """
 from __future__ import annotations
 
@@ -34,7 +36,8 @@ class Command:
     saturating_term: str = "none"
     path_poly: Optional[Tuple[float, float, float]] = None
     path_y_range: Optional[Tuple[int, int]] = None
-    lateral_target_dx: float = 0.0
+    lateral_target_dx: float = 0.0  # pixels, positive = target is right of ego centre
+    held_angle: float = 0.0         # angle held/decayed during low-visibility
 
     @property
     def packet(self) -> str:
@@ -122,7 +125,7 @@ def extract_ego_lane_target_px(
 
 def pure_pursuit_angle_deg(
     lateral_offset_m: float,
-    lookahead_m: float = 6.0,
+    lookahead_m: float = 4.0,
     wheelbase_m: float = 2.5,
 ) -> Tuple[float, float]:
     """Compute (heading_error_deg, pure_pursuit_steer_deg) from lateral offset and lookahead."""
@@ -133,6 +136,28 @@ def pure_pursuit_angle_deg(
     steer_rad = math.atan((2.0 * wb * math.sin(alpha)) / ld)
     steer_deg = math.degrees(steer_rad)
     return heading_err_deg, steer_deg
+
+
+def _monotonic_path_pts(c_pts: List[Tuple[float, float]], ego_center_px: float) -> List[Tuple[float, float]]:
+    """Return c_pts filtered so the x-values are monotonic (no sudden reversals > 30 px).
+
+    Iterates from the bottom (high y) upward, dropping any point that would create a hook
+    (reversal of more than 30 px relative to the previous kept point).
+    """
+    if len(c_pts) < 2:
+        return c_pts
+    kept = [c_pts[0]]
+    for pt in c_pts[1:]:
+        prev = kept[-1]
+        # Direction from bottom → current
+        dx_new = pt[1] - prev[1]
+        if len(kept) >= 2:
+            dx_old = kept[-1][1] - kept[-2][1]
+            # Drop if the direction reverses by more than 30 px
+            if dx_old * dx_new < 0 and abs(dx_new) > 30.0:
+                continue
+        kept.append(pt)
+    return kept
 
 
 def compute_command(
@@ -147,25 +172,25 @@ def compute_command(
     prev_angle: Optional[float] = None,
     hold_count: int = 0,
     prev_speed: Optional[float] = None,
+    ipm_valid: bool = False,
 ) -> Command:
     h, w = mask.shape
     ego_center_px = w / 2.0
 
     nz_y, nz_x = np.nonzero(mask)
     if len(nz_y) == 0:
-        if prev_angle is not None and hold_count < 5:
-            held = float(prev_angle)
-            return Command(
-                angle=held, speed=0.0, trust=trust, obstacle_flag=False, width_frac=0.0,
-                centroid_x=ego_center_px, obstacle_proximity=0.0, width_m=road_width_m, offset_m=lateral_offset_m,
-                heading_error_deg=0.0, raw_angle_deg=held, clamped_angle_deg=held, saturating_term="hold_angle",
-            )
-        return Command(0.0, 0.0, trust, False, 0.0, ego_center_px, 0.0, width_m=road_width_m, offset_m=lateral_offset_m)
+        # No drivable pixels at all — hold/decay angle, crawl
+        return _low_vis_command(
+            trust=min(trust, 0.15), dets=dets, cfg=cfg,
+            prev_angle=prev_angle, hold_count=hold_count,
+            prev_speed=prev_speed, h=h, w=w,
+            road_width_m=road_width_m, lateral_offset_m=lateral_offset_m,
+        )
 
     max_road_y = int(np.max(nz_y))
     band = cfg["lookahead_rows"]
     y_start = int(band[0] * h)
-    # Stop bottom_y above the hood line to avoid hood-split distortion
+    # Stop bottom_y at band[1]*h to avoid hood-split distortion
     bottom_y = min(int(band[1] * h), max_road_y)
     y_end = bottom_y
     if y_start >= y_end:
@@ -180,35 +205,33 @@ def compute_command(
         ego_window_half_m=float(cfg.get("ego_window_half_m", 1.8)),
     )
 
-    # Check if DL mask covers < 10% of visible road (frame 251 requirement)
+    # Check if DL mask covers < 10% of visible road (low-visibility branch)
     y_eval_start = int(0.45 * h)
     y_eval_end = int(0.75 * h)
     eval_area = max(1, (y_eval_end - y_eval_start) * int(0.6 * w))
     eval_roi = mask[y_eval_start:y_eval_end, int(0.2 * w):int(0.8 * w)]
     upper_frac = float(np.count_nonzero(eval_roi)) / float(eval_area)
     if upper_frac < 0.10:
-        trust = min(trust, 0.15)
-        if prev_angle is not None:
-            held = float(prev_angle)
-            return Command(
-                angle=held, speed=0.0, trust=trust, obstacle_flag=False, width_frac=0.0,
-                centroid_x=cx, obstacle_proximity=0.0, width_m=road_width_m, offset_m=lateral_offset_m,
-                heading_error_deg=0.0, raw_angle_deg=held, clamped_angle_deg=held, saturating_term="hold_angle",
-                path_poly=None, path_y_range=None, lateral_target_dx=held,
-            )
+        return _low_vis_command(
+            trust=min(trust, 0.15), dets=dets, cfg=cfg,
+            prev_angle=prev_angle, hold_count=hold_count,
+            prev_speed=prev_speed, h=h, w=w,
+            road_width_m=road_width_m, lateral_offset_m=lateral_offset_m,
+            cx=cx,
+        )
 
-    # If ego-lane corridor in lookahead band is missing, hold angle for up to 5 frames
+    # If ego-lane corridor in lookahead band is missing, use low-vis branch (up to 5 frames)
     if img_run_width_m <= 0.0 and (road_width_m is None or road_width_m < 1.0):
         if prev_angle is not None and hold_count < 5:
-            held = float(prev_angle)
-            return Command(
-                angle=held, speed=0.0, trust=trust, obstacle_flag=False, width_frac=0.0,
-                centroid_x=cx, obstacle_proximity=0.0, width_m=road_width_m, offset_m=lateral_offset_m,
-                heading_error_deg=0.0, raw_angle_deg=held, clamped_angle_deg=held, saturating_term="hold_angle",
-                path_poly=None, path_y_range=None, lateral_target_dx=held,
+            return _low_vis_command(
+                trust=trust, dets=dets, cfg=cfg,
+                prev_angle=prev_angle, hold_count=hold_count,
+                prev_speed=prev_speed, h=h, w=w,
+                road_width_m=road_width_m, lateral_offset_m=lateral_offset_m,
+                cx=cx,
             )
 
-    # 1. Extract per-row ego-lane centers across visible road band
+    # 1. Extract per-row ego-lane centres across visible road band
     c_pts: List[Tuple[float, float]] = []
     step = max(1, (bottom_y - y_start) // 12)
     for y in range(bottom_y, y_start - 1, -step):
@@ -239,7 +262,10 @@ def compute_command(
             run_c = (r_start + r_end) / 2.0
             c_pts.append((float(y), float(run_c)))
 
-    # Fit degree-2 polynomial x(y) = a*y^2 + b*y + c through per-row ego-lane centers
+    # Remove hooks/loops: filter monotonic in x
+    c_pts = _monotonic_path_pts(c_pts, ego_center_px)
+
+    # Fit degree-2 polynomial x(y) = a*y^2 + b*y + c through per-row ego-lane centres
     poly_tuple: Optional[Tuple[float, float, float]] = None
     if len(c_pts) >= 3:
         y_arr = np.array([pt[0] for pt in c_pts], dtype=np.float64)
@@ -255,11 +281,37 @@ def compute_command(
             poly_tuple = None
 
     px_to_m = float(cfg.get("bev_width_m", 10.0)) / max(1.0, float(w))
+
+    # Fixed metric lookahead: evaluate target at the row corresponding to lookahead_m
+    lookahead_m = float(cfg.get("lookahead_m", 4.0))
+    wheelbase_m = float(cfg.get("wheelbase_m", 2.5))
+    max_steer = float(cfg.get("max_steer_deg", 30.0))
+
+    # Convert lookahead_m to image row (if IPM valid), else use 0.62 of road height
+    if ipm_valid and road_width_m is not None and road_width_m > 0.5:
+        # Use the IPM bev_resolution to estimate pixel-per-metre, fallback to simple factor
+        bev_height_m = float(cfg.get("bev_height_m", 25.0))
+        visible_road_px = max(1, bottom_y - y_start)
+        px_per_m_vertical = visible_road_px / max(1.0, bev_height_m)
+        lookahead_row = int(bottom_y - lookahead_m * px_per_m_vertical)
+    else:
+        # 0.62 of the visible road height from the bottom
+        visible_road_px = max(1, bottom_y - y_start)
+        lookahead_row = int(bottom_y - 0.62 * visible_road_px)
+
+    lookahead_row = max(y_start, min(bottom_y - 1, lookahead_row))
+
     if poly_tuple is not None:
         a_p, b_p, c_p = poly_tuple
         x_bottom = a_p * (bottom_y ** 2) + b_p * bottom_y + c_p
-        x_target = a_p * (y_start ** 2) + b_p * y_start + c_p
-        # Target lateral displacement includes both road curvature and ego lane-centering
+        # Target: the polynomial evaluated at the fixed-lookahead row
+        x_target = a_p * (lookahead_row ** 2) + b_p * lookahead_row + c_p
+        # Clamp to fitted y-range to prevent extrapolation hooks
+        y_min_fit = min(pt[0] for pt in c_pts)
+        y_max_fit = max(pt[0] for pt in c_pts)
+        lookahead_row_clipped = max(int(y_min_fit), min(int(y_max_fit), lookahead_row))
+        x_target = a_p * (lookahead_row_clipped ** 2) + b_p * lookahead_row_clipped + c_p
+        # Target lateral displacement from ego centre
         delta_x = float(x_target - ego_center_px)
     else:
         x_bottom = cx
@@ -274,11 +326,6 @@ def compute_command(
         width_frac = float(np.clip(width_px / w, 0.0, 1.0))
     else:
         width_frac = 0.0
-
-    # Derive pure pursuit steering angle from SAME lateral target (x_target - x_bottom)
-    lookahead_m = float(cfg.get("lookahead_m", cfg.get("bev_lookahead_m", 6.0)))
-    wheelbase_m = float(cfg.get("wheelbase_m", 2.5))
-    max_steer = float(cfg.get("max_steer_deg", 30.0))
 
     eff_offset_m = delta_x * px_to_m
     eff_width_m = road_width_m if (road_width_m is not None and road_width_m >= 2.5) else img_run_width_m
@@ -303,49 +350,15 @@ def compute_command(
     else:
         angle_deg = clamped_angle_deg
 
-    # Enforce 100% sign agreement between drawn path lateral target delta_x and steering angle_deg
+    # Enforce sign agreement between drawn path lateral target and steering angle
     if abs(delta_x) > 0.5:
         if delta_x > 0 and angle_deg < 0:
             angle_deg = min(max_steer, max(0.5, clamped_angle_deg * 0.5))
         elif delta_x < -0.5 and angle_deg > 0:
             angle_deg = max(-max_steer, min(-0.5, clamped_angle_deg * 0.5))
 
-    # Obstacle check:
-    # 1. Obstacles must overlap the ego path polygon: predicted path width plus ~1.2m margin each side.
-    # 2. Far boxes (rel_y < 0.40) must NOT set the flag.
-    # 3. Replace approach_rate > 1.0 with sustained growth (> 1.12 over 5 frames) AND inside corridor AND y >= 0.40*h.
-    obs_flag = False
-    prox = 0.0
-
-    for d in dets:
-        rel_y = d.y2 / float(h)
-        # Far boxes (frame 243) must not set the flag
-        if rel_y < 0.40:
-            continue
-
-        y_eval = min(h - 1, max(0, d.y2))
-        if poly_tuple is not None:
-            a_p, b_p, c_p = poly_tuple
-            x_center_path = a_p * (y_eval ** 2) + b_p * y_eval + c_p
-        else:
-            x_center_path = ego_center_px + (cx - ego_center_px) * ((h - y_eval) / max(1.0, h - y_start))
-
-        # Corridor: predicted path width plus ~1.2m margin each side (perspective scaling)
-        w_corr = max(0.12 * w, (0.08 + 0.14 * (y_eval / float(h))) * w)
-        corr_left = x_center_path - w_corr
-        corr_right = x_center_path + w_corr
-
-        # Overlap check with ego path corridor
-        in_corridor = (d.x2 > corr_left) and (d.x1 < corr_right)
-        if in_corridor and rel_y > prox:
-            prox = rel_y
-
-        is_confirmed = (d.tracker_id is None) or (getattr(d, "consecutive_detections", 1) >= 2)
-        has_sustained_growth = getattr(d, "sustained_growth", False) or (d.approach_rate > 1.05 and d.tracker_id is None)
-        is_threat = (rel_y >= 0.55) or has_sustained_growth
-
-        if is_confirmed and in_corridor and is_threat:
-            obs_flag = True
+    # Obstacle check
+    obs_flag, prox = _check_obstacles(dets, h, poly_tuple, ego_center_px, cx, y_start)
 
     # Speed calculation
     v_max = float(cfg.get("v_max", 1.5))
@@ -367,7 +380,12 @@ def compute_command(
     elif width_frac < cfg.get("width_ref", 0.35):
         speed *= max(0.3, width_frac / max(1e-4, cfg.get("width_ref", 0.35)))
 
-    # Obstacle speed drop (only if confirmed threat in ego corridor)
+    # Steering-angle speed scaling: high angle → slow down
+    angle_factor_min = float(cfg.get("speed_angle_factor_min", 0.4))
+    angle_denom = float(cfg.get("speed_angle_denom", 45.0))
+    speed *= max(angle_factor_min, 1.0 - abs(angle_deg) / angle_denom)
+
+    # Obstacle speed drop
     if obs_flag:
         prox_stop = float(cfg.get("prox_stop", 0.85))
         prox_slow = float(cfg.get("prox_slow", 0.55))
@@ -414,4 +432,131 @@ def compute_command(
         path_poly=poly_tuple,
         path_y_range=(y_start, bottom_y),
         lateral_target_dx=delta_x,
+        held_angle=0.0,
+    )
+
+
+def _check_obstacles(
+    dets: List[Detection],
+    h: int,
+    poly_tuple: Optional[Tuple[float, float, float]],
+    ego_center_px: float,
+    cx: float,
+    y_start: int,
+) -> Tuple[bool, float]:
+    """Return (obstacle_flag, proximity) from detections vs ego corridor."""
+    obs_flag = False
+    prox = 0.0
+    for d in dets:
+        rel_y = d.y2 / float(h)
+        if rel_y < 0.40:
+            continue
+        y_eval = min(h - 1, max(0, d.y2))
+        if poly_tuple is not None:
+            a_p, b_p, c_p = poly_tuple
+            x_center_path = a_p * (y_eval ** 2) + b_p * y_eval + c_p
+        else:
+            x_center_path = ego_center_px + (cx - ego_center_px) * ((h - y_eval) / max(1.0, h - y_start))
+
+        w_corr = max(0.12 * (d.x2 - d.x1 + d.width) / max(1, d.width) * 100,
+                     (0.08 + 0.14 * (y_eval / float(h))) * (ego_center_px * 2))
+        # simpler: use corridor half-width in pixels
+        w_corr = max(0.12 * ego_center_px * 2, (0.08 + 0.14 * (y_eval / float(h))) * ego_center_px * 2)
+        corr_left = x_center_path - w_corr
+        corr_right = x_center_path + w_corr
+
+        in_corridor = (d.x2 > corr_left) and (d.x1 < corr_right)
+        if in_corridor and rel_y > prox:
+            prox = rel_y
+
+        is_confirmed = (d.tracker_id is None) or (getattr(d, "consecutive_detections", 1) >= 2)
+        has_sustained_growth = getattr(d, "sustained_growth", False) or (d.approach_rate > 1.05 and d.tracker_id is None)
+        is_threat = (rel_y >= 0.55) or has_sustained_growth
+
+        if is_confirmed and in_corridor and is_threat:
+            obs_flag = True
+    return obs_flag, prox
+
+
+def _low_vis_command(
+    trust: float,
+    dets: List[Detection],
+    cfg: Dict[str, Any],
+    prev_angle: Optional[float],
+    hold_count: int,
+    prev_speed: Optional[float],
+    h: int,
+    w: int,
+    road_width_m: Optional[float] = None,
+    lateral_offset_m: Optional[float] = None,
+    cx: Optional[float] = None,
+) -> Command:
+    """Low-visibility fallback: hold angle 5 frames then decay to 0, crawl instead of stop."""
+    ego_center_px = w / 2.0
+    if cx is None:
+        cx = ego_center_px
+
+    hold_frames = int(cfg.get("low_vis_hold_frames", 5))
+    decay_frames = int(cfg.get("low_vis_decay_frames", 10))
+    crawl_floor = float(cfg.get("crawl_speed_floor", cfg.get("slow_speed_floor", 0.20)))
+    max_steer = float(cfg.get("max_steer_deg", 30.0))
+
+    if prev_angle is not None:
+        if hold_count < hold_frames:
+            # Hold last valid angle
+            held = float(prev_angle)
+            saturating_term = "hold_angle"
+        else:
+            # Decay towards 0 over decay_frames frames
+            decay_steps = hold_count - hold_frames
+            decay_factor = max(0.0, 1.0 - decay_steps / max(1, decay_frames))
+            held = float(prev_angle) * decay_factor
+            saturating_term = "decay_angle"
+        angle_deg = max(-max_steer, min(max_steer, held))
+    else:
+        held = 0.0
+        angle_deg = 0.0
+        saturating_term = "hold_angle"
+
+    # Still compute obstacle check for safety
+    obs_flag = False
+    if dets:
+        # Quick corridor check without poly
+        for d in dets:
+            rel_y = d.y2 / float(h)
+            if rel_y >= 0.55 and abs(d.center_x - ego_center_px) < 0.25 * w:
+                obs_flag = True
+                break
+
+    # Crawl speed (not zero), unless obstacle confirmed close
+    speed = crawl_floor
+    if obs_flag:
+        speed = 0.0
+    elif prev_speed is not None:
+        max_ramp = float(cfg.get("max_speed_ramp", 0.15))
+        delta_v = speed - float(prev_speed)
+        delta_v = max(-max_ramp, min(max_ramp, delta_v))
+        speed = max(0.0, float(prev_speed) + delta_v)
+
+    if speed < 0.05:
+        speed = 0.0
+
+    return Command(
+        angle=angle_deg,
+        speed=speed,
+        trust=trust,
+        obstacle_flag=obs_flag,
+        width_frac=0.0,
+        centroid_x=cx,
+        obstacle_proximity=0.0,
+        width_m=road_width_m,
+        offset_m=lateral_offset_m,
+        heading_error_deg=0.0,
+        raw_angle_deg=angle_deg,
+        clamped_angle_deg=angle_deg,
+        saturating_term=saturating_term,
+        path_poly=None,
+        path_y_range=None,
+        lateral_target_dx=0.0,
+        held_angle=angle_deg,
     )

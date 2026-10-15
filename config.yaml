@@ -299,15 +299,18 @@ inference:
     max_steer_deg: 30.0
     v_max: 1.5
     slow_speed_floor: 0.3
+    crawl_speed_floor: 0.20
     trust_min: 0.3
     width_ref: 0.35
     lookahead_rows:
     - 0.55
     - 0.9
-    lookahead_m: 6.0
+    lookahead_m: 4.0
+    bev_height_m: 25.0
     wheelbase_m: 2.5
     steer_ema_alpha: 0.4
     max_steer_rate_deg: 5.0
+    max_speed_ramp: 0.15
     max_ego_lane_width_m: 4.0
     ego_window_half_m: 1.8
     prox_slow: 0.55
@@ -319,6 +322,10 @@ inference:
     - 0.5
     - 0.3
     obstacle_dilate_px: 6
+    low_vis_hold_frames: 5
+    low_vis_decay_frames: 10
+    speed_angle_factor_min: 0.4
+    speed_angle_denom: 45.0
 
 camera:
   height_m: 1.3

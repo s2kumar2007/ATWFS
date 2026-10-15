@@ -1,20 +1,21 @@
-metric,baseline,measured_v3,delta
-avg_fps,11.18,12.20,+1.02 FPS (1.09x)
-read_ms,2.28,2.06,-0.22 ms
-preprocess_ms,8.71,7.87,-0.84 ms
-model_ms,59.87,49.28,-10.59 ms
-classical_ms,8.31,7.97,-0.34 ms
-yolo_per_frame_ms,0.99,1.16,+0.17 ms
-yolo_active_pass_ms,97.00,90.43,-6.57 ms
-ipm_ms,2.52,2.05,-0.47 ms
-postprocess_ms,3.19,2.73,-0.46 ms
-annotate_ms,13.80,10.25,-3.55 ms
-write_ms,6.33,5.12,-1.21 ms
-obstacle_flag_pct,40.0%,12.3%,-27.7%
-detections_per_frame,1.52,2.19,+0.67
-zero_detection_frames,54,0,-54 frames (0.0%)
-steer_zero_pct,n/a,0.0%,0 frames
-steer_ge20_pct,8.0%,7.3%,-0.7%
-steer_saturation_pct,0.0%,0.0%,0.0%
-path_steer_sign_agreement,n/a,100.0%,100.0%
-mode_switches,n/a,0,0
+metric,baseline,v4_run1_ac,v4_run2_dc,v4_run3_dc
+avg_fps,11.18,12.91,3.65,3.59
+p95_fps,7.52,12.22,3.28,2.94
+stage_read_ms,2.28,2.15,3.29,3.55
+stage_preprocess_ms,8.71,1.18,4.41,4.65
+stage_model_ms,59.87,47.23,211.43,213.98
+stage_classical_ms,8.31,6.44,16.91,17.15
+stage_yolo_per_frame_ms,0.99,1.34,2.82,2.87
+stage_yolo_active_pass_ms,97.00,83.02,383.51,393.59
+stage_ipm_ms,2.52,1.82,4.87,4.94
+stage_postprocess_ms,3.19,2.50,6.76,6.72
+stage_annotate_ms,13.80,9.16,23.50,24.06
+stage_write_ms,6.33,4.63,12.56,12.81
+detections_per_frame,1.52,2.19,2.13,2.13
+fallback_pct,22.3%,41.3%,41.3%,41.3%
+obstacle_flag_pct,40.0%,12.7%,10.0%,10.3%
+steer_ge15_pct,12.0%,9.3%,9.3%,9.3%
+steer_ge20_pct,8.0%,1.0%,1.0%,1.0%
+steer_saturation_pct,0.0%,0.0%,0.0%,0.0%
+speed_zero_pct,N/A,2.0%,2.0%,2.0%
+estimator_switches,N/A,5,5,5

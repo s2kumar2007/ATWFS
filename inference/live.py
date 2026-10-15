@@ -58,7 +58,8 @@ class LivePipeline:
         onnx_session: Optional[Any] = None,
     ) -> None:
         self.cfg = cfg
-        self.profile_name = profile_name
+        if isinstance(device, str):
+            device = torch.device(device)
         self.device = device
         if model is not None:
             self.model = model.to(device).eval()
@@ -115,8 +116,21 @@ class LivePipeline:
         self.consec_ious: List[float] = []
         self._prev_fused_mask: Optional[np.ndarray] = None
 
+        # Estimator hysteresis state (DL ↔ FALLBACK)
+        inf_cfg = cfg.get("inference", {})
+        self.current_estimator: str = "DL"
+        self.estimator_dwell: int = 0
+        self.fallback_consec_count: int = 0
+        self.min_dwell: int = int(inf_cfg.get("estimator_min_dwell", 10))
+        self.fallback_consec_threshold: int = int(inf_cfg.get("fallback_consec_threshold", 5))
+        self.estimator_switch_count: int = 0
+
+        # Classical estimator skip/cache parameters
+        self.classical_skip_alpha: float = float(inf_cfg.get("classical_skip_alpha", 0.8))
+        self.classical_cache_frames: int = int(inf_cfg.get("classical_cache_frames", 2))
+
         # Segmentation skipping cadence
-        self.seg_every = max(1, int(cfg.get("inference", {}).get("seg_every", 2 if profile_name == "cpu" else 1)))
+        self.seg_every = max(1, int(inf_cfg.get("seg_every", 2 if profile_name == "cpu" else 1)))
         self.last_raw_mask: Optional[np.ndarray] = None
         self.last_fused_alpha: float = 1.0
         self.last_active: str = "DL"
@@ -201,6 +215,63 @@ class LivePipeline:
             if hasattr(self.model, "set_mode"):
                 self.model.set_mode(self.current_mode)
 
+        # End preprocess timing
+        t_prep_ms = (time.perf_counter() - t_stage0) * 1000.0
+        self.timings["preprocess"] += t_prep_ms / 1000.0
+        self.stage_samples["preprocess"].append(t_prep_ms)
+
+        # 1b. YOLO DETECTIONS (runs early so detections suppress classical fallback mask)
+        t_yolo0 = time.perf_counter()
+        dets = self.detector.detect(frame_bgr, frame_idx)
+        if self.hood_poly_norm is not None:
+            hp_fw_fh = np.zeros_like(self.hood_poly_norm, dtype=np.int32)
+            hp_fw_fh[:, 0] = self.hood_poly_norm[:, 0] * fw
+            hp_fw_fh[:, 1] = self.hood_poly_norm[:, 1] * fh
+            valid_dets = [d for d in dets if cv2.pointPolygonTest(hp_fw_fh, (d.center_x, d.center_y), False) < 0]
+            dets = valid_dets
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        t_yolo_ms = (time.perf_counter() - t_yolo0) * 1000.0
+        self.timings["yolo"] += t_yolo_ms / 1000.0
+        self.stage_samples["YOLO"].append(t_yolo_ms)
+
+        scale_x = float(nw) / max(1.0, float(fw))
+        scale_y = float(nh) / max(1.0, float(fh))
+        dets_model = [
+            Detection(
+                x1=int(round(d.x1 * scale_x)),
+                y1=int(round(d.y1 * scale_y)),
+                x2=int(round(d.x2 * scale_x)),
+                y2=int(round(d.y2 * scale_y)),
+                cls_id=d.cls_id,
+                name=d.name,
+                conf=d.conf,
+                kind=d.kind,
+                approach_rate=d.approach_rate,
+                tracker_id=d.tracker_id,
+                last_update_frame=d.last_update_frame,
+                consecutive_detections=d.consecutive_detections,
+            )
+            for d in dets
+        ]
+        dets_padded = [
+            Detection(
+                x1=d.x1 + pad_left,
+                y1=d.y1 + pad_top,
+                x2=d.x2 + pad_left,
+                y2=d.y2 + pad_top,
+                cls_id=d.cls_id,
+                name=d.name,
+                conf=d.conf,
+                kind=d.kind,
+                approach_rate=d.approach_rate,
+                tracker_id=d.tracker_id,
+                last_update_frame=d.last_update_frame,
+                consecutive_detections=d.consecutive_detections,
+            )
+            for d in dets_model
+        ]
+
         # Check if segmentation forward pass is skipped
         skip_seg = (self.seg_every > 1) and (frame_idx % self.seg_every != 0) and (self.last_raw_mask is not None)
 
@@ -212,7 +283,6 @@ class LivePipeline:
             terrain = self.last_terrain
             active_str = self.last_active
             fused_alpha = self.last_fused_alpha
-            self.stage_samples["preprocess"].append(0.0)
             self.stage_samples["model"].append(0.0)
             self.stage_samples["classical"].append(0.0)
         else:
@@ -221,11 +291,6 @@ class LivePipeline:
                 rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
                 x_norm = rgb.astype(np.float32) * self.inv_255_std + self.sub_mean_std
                 x_np = np.ascontiguousarray(x_norm.transpose(2, 0, 1)[np.newaxis, ...])
-
-                t_prep_ms = (time.perf_counter() - t_stage0) * 1000.0
-                self.timings["preprocess"] += t_prep_ms / 1000.0
-                self.stage_samples["preprocess"].append(t_prep_ms)
-
                 # 2. MODEL FORWARD (ONNX)
                 t_stage0 = time.perf_counter()
                 seg_logits_np, alpha_np = self.onnx_session.run(None, {"image": x_np})
@@ -244,7 +309,7 @@ class LivePipeline:
                 t_mod_ms = (time.perf_counter() - t_stage0) * 1000.0
                 self.timings["model"] += t_mod_ms / 1000.0
                 self.stage_samples["model"].append(t_mod_ms)
-            else:
+            elif self.model is not None:
                 if self.device.type == "cuda":
                     # GPU letterbox, norm and fp16
                     t_u8 = torch.from_numpy(padded).to(self.device, non_blocking=True)
@@ -254,10 +319,6 @@ class LivePipeline:
                 else:
                     x = (cv2.cvtColor(padded, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0 - self.mean) / self.std
                     x_tensor = torch.from_numpy(x.transpose(2, 0, 1)).unsqueeze(0).to(self.device, memory_format=torch.channels_last)
-
-                t_prep_ms = (time.perf_counter() - t_stage0) * 1000.0
-                self.timings["preprocess"] += t_prep_ms / 1000.0
-                self.stage_samples["preprocess"].append(t_prep_ms)
 
                 # 2. MODEL FORWARD (PyTorch)
                 t_stage0 = time.perf_counter()
@@ -286,6 +347,10 @@ class LivePipeline:
                 t_mod_ms = (time.perf_counter() - t_stage0) * 1000.0
                 self.timings["model"] += t_mod_ms / 1000.0
                 self.stage_samples["model"].append(t_mod_ms)
+            else:
+                dl_mask_padded = np.zeros((mh, mw), dtype=np.uint8)
+                unc = 0.95
+                terrain = 0
 
             dl_mask = dl_mask_padded[pad_top:pad_top + nh, pad_left:pad_left + nw]
 
@@ -296,11 +361,15 @@ class LivePipeline:
             self.prev_dl_mask = dl_mask.copy()
 
             alpha_val = self.fusion.alpha(unc, geo, tmp, terrain)
-            if alpha_val < self.fallback_alpha_gate:
-                fb_mask_padded = self.classical.estimate(padded, horizon_y=int(0.25 * mh))
-                fb_mask = fb_mask_padded[pad_top:pad_top + nh, pad_left:pad_left + nw]
-            else:
-                fb_mask = np.zeros_like(dl_mask)
+            fb_mask_padded, _ = self.classical.estimate_with_cache(
+                padded,
+                alpha=alpha_val,
+                skip_alpha=self.classical_skip_alpha,
+                cache_frames=self.classical_cache_frames,
+                horizon_y=int(0.25 * mh),
+                dets=dets_padded,
+            )
+            fb_mask = fb_mask_padded[pad_top:pad_top + nh, pad_left:pad_left + nw]
 
             fused = self.fusion.fuse(dl_mask, fb_mask, unc, geo, tmp, terrain)
             mask = fused.mask
@@ -358,47 +427,8 @@ class LivePipeline:
         self.timings["postprocess"] += t_post_ms / 1000.0
         self.stage_samples["postprocess"].append(t_post_ms)
 
-        # 5. YOLO DETECTIONS
+        # 5. MODEL-RESOLUTION OBSTACLE SUBTRACTION & IPM
         t_stage0 = time.perf_counter()
-        dets = self.detector.detect(frame_bgr, frame_idx)
-
-        # Ignore detections inside hood polygon
-        if self.hood_poly_norm is not None:
-            hp_fw_fh = np.zeros_like(self.hood_poly_norm, dtype=np.int32)
-            hp_fw_fh[:, 0] = self.hood_poly_norm[:, 0] * fw
-            hp_fw_fh[:, 1] = self.hood_poly_norm[:, 1] * fh
-            valid_dets = [d for d in dets if cv2.pointPolygonTest(hp_fw_fh, (d.center_x, d.center_y), False) < 0]
-            dets = valid_dets
-
-        if self.device.type == "cuda":
-            torch.cuda.synchronize()
-        t_yolo_ms = (time.perf_counter() - t_stage0) * 1000.0
-        self.timings["yolo"] += t_yolo_ms / 1000.0
-        self.stage_samples["YOLO"].append(t_yolo_ms)
-
-        # 6. MODEL-RESOLUTION OBSTACLE SUBTRACTION & IPM
-        t_stage0 = time.perf_counter()
-        scale_x = float(nw) / max(1.0, float(fw))
-        scale_y = float(nh) / max(1.0, float(fh))
-        dets_model = [
-            Detection(
-                x1=int(round(d.x1 * scale_x)),
-                y1=int(round(d.y1 * scale_y)),
-                x2=int(round(d.x2 * scale_x)),
-                y2=int(round(d.y2 * scale_y)),
-                cls_id=d.cls_id,
-                name=d.name,
-                conf=d.conf,
-                kind=d.kind,
-                approach_rate=d.approach_rate,
-                tracker_id=d.tracker_id,
-                last_update_frame=d.last_update_frame,
-                consecutive_detections=d.consecutive_detections,
-            )
-            for d in dets
-        ]
-
-        # Subtract obstacles on model-resolution mask
         dilate_model = max(1, int(round(self.cfg["inference"]["decision"]["obstacle_dilate_px"] * scale_x)))
         mask_sub = subtract_obstacles(mask, dets_model, dilate_model)
 
@@ -415,7 +445,7 @@ class LivePipeline:
         self.timings["ipm"] += t_ipm_ms / 1000.0
         self.stage_samples["IPM"].append(t_ipm_ms)
 
-        # 7. COMPUTE DECISION COMMAND
+        # 6. COMPUTE DECISION COMMAND
         cmd = compute_command(
             mask_sub,
             dets_model,
@@ -428,6 +458,7 @@ class LivePipeline:
             prev_angle=self.prev_steer_angle,
             hold_count=self.steer_hold_counter,
             prev_speed=self.prev_speed,
+            ipm_valid=ipm_res.valid,
         )
         self.prev_steer_angle = cmd.angle
         self.prev_speed = cmd.speed
@@ -435,6 +466,45 @@ class LivePipeline:
             self.steer_hold_counter += 1
         else:
             self.steer_hold_counter = 0
+
+        # 7. ESTIMATOR HYSTERESIS:
+        # Require 5 consecutive frames below threshold before switching to FALLBACK.
+        # Require 5 consecutive frames above threshold before switching back to DL.
+        # Enforce minimum 10-frame dwell once in a mode.
+        fallback_threshold = float(self.cfg["fusion"].get("fallback_threshold", 0.5))
+        trust_is_low = (cmd.trust < fallback_threshold)
+
+        if self.current_estimator == "DL":
+            if trust_is_low:
+                self.fallback_consec_count += 1
+            else:
+                self.fallback_consec_count = 0
+            if self.fallback_consec_count >= self.fallback_consec_threshold and self.estimator_dwell >= self.min_dwell:
+                self.current_estimator = "FALLBACK"
+                self.estimator_dwell = 0
+                self.estimator_switch_count += 1
+                self.fallback_consec_count = 0
+            else:
+                self.estimator_dwell += 1
+        else:  # current_estimator == "FALLBACK"
+            if not trust_is_low:
+                self.fallback_consec_count += 1
+            else:
+                self.fallback_consec_count = 0
+            if self.fallback_consec_count >= self.fallback_consec_threshold and self.estimator_dwell >= self.min_dwell:
+                self.current_estimator = "DL"
+                self.estimator_dwell = 0
+                self.estimator_switch_count += 1
+                self.fallback_consec_count = 0
+            else:
+                self.estimator_dwell += 1
+
+        # Display override:
+        # If in FALLBACK mode via hysteresis OR trust-capped (<= 0.15), show "FALLBACK"
+        if self.current_estimator == "FALLBACK" or cmd.trust <= 0.15:
+            active_str = "FALLBACK"
+        else:
+            active_str = "DL"
 
         # Track consecutive-frame mask IoU
         if self._prev_fused_mask is not None:
@@ -891,17 +961,23 @@ class WriterWorker(threading.Thread):
         try:
             check_frame_indices = {
                 1: "frame_01_idx1.jpg",
-                51: "frame_02_idx51.jpg",
-                101: "frame_03_idx101.jpg",
-                151: "frame_04_idx151.jpg",
-                201: "frame_05_idx201.jpg",
-                251: "frame_06_idx251.jpg",
-                484: "frame_07_idx484.jpg",
-                726: "frame_08_idx726.jpg",
-                968: "frame_09_idx968.jpg",
-                1210: "frame_10_idx1210.jpg",
-                1452: "frame_11_idx1452.jpg",
-                1695: "frame_12_idx1695.jpg",
+                26: "frame_02_idx26.jpg",
+                51: "frame_03_idx51.jpg",
+                76: "frame_04_idx76.jpg",
+                101: "frame_05_idx101.jpg",
+                126: "frame_06_idx126.jpg",
+                151: "frame_07_idx151.jpg",
+                176: "frame_08_idx176.jpg",
+                201: "frame_09_idx201.jpg",
+                226: "frame_10_idx226.jpg",
+                237: "frame_11_idx237.jpg",
+                244: "frame_12_idx244.jpg",
+                259: "frame_13_idx259.jpg",
+                266: "frame_14_idx266.jpg",
+                276: "frame_15_idx276.jpg",
+                285: "frame_16_idx285.jpg",
+                299: "frame_17_idx300.jpg",
+                300: "frame_17_idx300.jpg",
             }
             while not self.stop.is_set():
                 item = self.in_q.get()
@@ -927,9 +1003,9 @@ class WriterWorker(threading.Thread):
                 self.p.timings["annotate"] += t_ann_ms / 1000.0
                 self.p.stage_samples["annotate"].append(t_ann_ms)
 
-                # Export reference check frames to check_frames_v3
+                # Export reference check frames to check_frames_v4
                 if idx in check_frame_indices:
-                    cf_dir = self.out_dir / "check_frames_v3"
+                    cf_dir = self.out_dir / "check_frames_v4"
                     cf_dir.mkdir(parents=True, exist_ok=True)
                     cv2.imwrite(str(cf_dir / check_frame_indices[idx]), ann_frame)
 
@@ -1028,9 +1104,18 @@ def run_video(
     try:
         import psutil
         physical_cores = psutil.cpu_count(logical=False) or os.cpu_count() or 4
+        try:
+            p = psutil.Process()
+            p.nice(psutil.HIGH_PRIORITY_CLASS)
+        except Exception:
+            pass
     except Exception:
         physical_cores = os.cpu_count() or 4
     torch.set_num_threads(physical_cores)
+    try:
+        cv2.setNumThreads(min(4, physical_cores))
+    except Exception:
+        pass
 
     # Select and apply profile
     if profile is None:
@@ -1123,6 +1208,7 @@ def run_video(
             if onnx_path.is_file():
                 opts = onnxruntime.SessionOptions()
                 opts.intra_op_num_threads = min(6, physical_cores)
+                opts.inter_op_num_threads = 1
                 opts.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
                 opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
                 onnx_session = onnxruntime.InferenceSession(str(onnx_path), opts, providers=["CPUExecutionProvider"])
@@ -1219,8 +1305,10 @@ def run_video(
     trust_list: List[float] = []
     fps_q: Deque[float] = collections.deque(maxlen=30)
     t_last_frame = time.perf_counter()
+    sat_15_count = 0
     sat_20_count = 0
     sat_29_count = 0
+    speed_zero_count = 0
     steer_zero_count = 0
     sign_agree_count = 0
     zero_det_count = 0
@@ -1258,11 +1346,15 @@ def run_video(
 
             if abs(res.command.angle) < 1e-3:
                 steer_zero_count += 1
+            if res.command.speed < 0.05:
+                speed_zero_count += 1
             dx = getattr(res.command, "lateral_target_dx", 0.0)
             ang = res.command.angle
             if (dx > 0 and ang > 0) or (dx < 0 and ang < 0) or (abs(dx) <= 0.5 and abs(ang) <= 0.5) or (abs(dx) < 1e-3 and abs(ang) < 1e-3):
                 sign_agree_count += 1
 
+            if abs(res.command.angle) >= 15.0:
+                sat_15_count += 1
             if abs(res.command.angle) >= 20.0:
                 sat_20_count += 1
             if abs(res.command.angle) >= 29.5:
@@ -1381,8 +1473,10 @@ def run_video(
         print(f"{'YOLO (active pass)':<20} | {m_act:<10.2f} | {p95_act:<10.2f} | {tot_act:<10.2f}")
     print("=" * 70)
 
+    sat_15_pct = (sat_15_count / total_pkts) * 100.0
     sat_20_pct = (sat_20_count / total_pkts) * 100.0
     sat_29_pct = (sat_29_count / total_pkts) * 100.0
+    speed_zero_pct = (speed_zero_count / total_pkts) * 100.0
     fb_pct = (fallback_count / total_pkts) * 100.0
     alpha_below_pct = (alpha_below_thr_count / total_pkts) * 100.0
     obs_pct = (obstacle_count / total_pkts) * 100.0
@@ -1397,42 +1491,48 @@ def run_video(
     sign_agree_pct = (sign_agree_count / total_pkts) * 100.0
     zero_det_pct = (zero_det_count / total_pkts) * 100.0
     mode_switches = getattr(pipeline, "mode_switch_count", 0)
+    est_switches = getattr(pipeline, "estimator_switch_count", 0)
+    model_gt_150 = sum(1 for m in pipeline.stage_samples.get("model", []) if m > 150.0)
 
     print(f"Average FPS: {avg_fps:.2f} (P95 FPS: {p95_fps:.2f})")
     print(f"Trust (min/mean/max): {t_min:.3f} / {t_mean:.3f} / {t_max:.3f}")
     print(f"FALLBACK frames: {fb_pct:.1f}% (alpha < thr: {alpha_below_pct:.1f}%)")
+    print(f"Estimator Switches (DL<->FALLBACK): {est_switches}")
     print(f"Obstacle Flag frames: {obs_pct:.1f}% ({len(obs_frames)} frames: {obs_frames[:15]}...)")
     print(f"Mean Detections/frame: {mean_dets:.2f}")
     print(f"Frames with 0 detections: {zero_det_pct:.1f}% ({zero_det_count}/{total_pkts} frames: {zero_det_frames[:15]}...)")
     print(f"Steering == 0.0 deg: {steer_zero_pct:.1f}% ({steer_zero_count}/{total_pkts} frames)")
+    print(f"Steering (|angle| >= 15.0 deg): {sat_15_pct:.1f}%")
     print(f"Steering (|angle| >= 20.0 deg): {sat_20_pct:.1f}%")
     print(f"Steering saturation (|angle| >= 29.5 deg): {sat_29_pct:.1f}%")
+    print(f"Speed == 0.0 m/s frames: {speed_zero_pct:.1f}% ({speed_zero_count}/{total_pkts} frames)")
+    print(f"Frames with model time > 150ms: {model_gt_150}")
     print(f"Path/Steer sign agreement: {sign_agree_pct:.1f}%")
-    print(f"Mode switches: {mode_switches} (Current: {pipeline.current_mode})")
+    print(f"Mode switches (day/night): {mode_switches} (Current: {pipeline.current_mode})")
 
-    # Baseline comparison (user prompt specifies 300-frame cpu-profile run as baseline:
-    # 7.04 FPS, model 103 ms, YOLO 14 ms, 1.99 detections per frame)
+    # Baseline comparison (11.18 FPS baseline from newest measured run on this video)
     baseline_300 = {
-        "avg_fps": 7.04,
-        "p95_fps": 6.80,
-        "mean_detections": 1.99,
-        "fallback_pct": 3.3,
-        "obstacle_flag_pct": 50.0,
-        "steer_saturation_pct_before": 51.7,
-        "steer_ge20_pct_before": 54.3,
-        "trust_min": 0.279,
-        "trust_mean": 0.760,
-        "trust_max": 0.921,
+        "avg_fps": 11.18,
+        "p95_fps": 7.52,
+        "mean_detections": 1.52,
+        "fallback_pct": 22.3,
+        "obstacle_flag_pct": 40.0,
+        "steer_saturation_pct_before": 0.0,
+        "steer_ge20_pct_before": 8.0,
+        "steer_ge15_pct_before": 12.0,
+        "trust_min": 0.049,
+        "trust_mean": 0.684,
+        "trust_max": 0.928,
         "stages": {
-            "read": {"mean_ms": 2.10, "p95_ms": 2.80},
-            "preprocess": {"mean_ms": 7.40, "p95_ms": 9.20},
-            "model": {"mean_ms": 103.00, "p95_ms": 115.00},
-            "classical": {"mean_ms": 1.20, "p95_ms": 1.80},
-            "YOLO": {"mean_ms": 14.00, "p95_ms": 18.00},
-            "IPM": {"mean_ms": 1.40, "p95_ms": 2.20},
-            "postprocess": {"mean_ms": 2.40, "p95_ms": 3.10},
-            "annotate": {"mean_ms": 4.90, "p95_ms": 6.50},
-            "write": {"mean_ms": 3.60, "p95_ms": 5.20},
+            "read": {"mean_ms": 2.28, "p95_ms": 3.10},
+            "preprocess": {"mean_ms": 8.71, "p95_ms": 11.20},
+            "model": {"mean_ms": 59.87, "p95_ms": 68.40},
+            "classical": {"mean_ms": 8.31, "p95_ms": 12.50},
+            "YOLO": {"mean_ms": 0.99, "p95_ms": 1.50},
+            "IPM": {"mean_ms": 2.52, "p95_ms": 3.80},
+            "postprocess": {"mean_ms": 3.19, "p95_ms": 4.50},
+            "annotate": {"mean_ms": 13.80, "p95_ms": 18.20},
+            "write": {"mean_ms": 6.33, "p95_ms": 9.10},
         }
     }
     b_data = baseline_300
@@ -1451,11 +1551,12 @@ def run_video(
             label = "stage_yolo_per_frame_ms" if st == "YOLO" else f"stage_{st}_ms"
             w.writerow([label, f"{b_mean:.2f}", f"{a_mean:.2f}", ratio])
         if "YOLO_active_pass" in stage_stats:
-            w.writerow(["stage_yolo_active_pass_ms", "57.90", f"{stage_stats['YOLO_active_pass']['mean_ms']:.2f}", f"{57.90 / max(0.01, stage_stats['YOLO_active_pass']['mean_ms']):.2f}x faster"])
-        w.writerow(["steer_ge20_pct", f"{b_data.get('steer_ge20_pct_before', 54.3):.1f}%", f"{sat_20_pct:.1f}%", f"{sat_20_pct - b_data.get('steer_ge20_pct_before', 54.3):+.1f}%"])
-        w.writerow(["steer_saturation_pct", f"{b_data.get('steer_saturation_pct_before', 51.7):.1f}%", f"{sat_29_pct:.1f}%", f"{sat_29_pct - b_data.get('steer_saturation_pct_before', 51.7):+.1f}%"])
-        w.writerow(["mean_detections", f"{b_data.get('mean_detections', 1.99):.2f}", f"{mean_dets:.2f}", f"{mean_dets - b_data.get('mean_detections', 1.99):+.2f}"])
-        w.writerow(["fallback_pct", f"{b_data.get('fallback_pct', 3.3):.1f}%", f"{fb_pct:.1f}%", "exact match"])
+            w.writerow(["stage_yolo_active_pass_ms", "97.00", f"{stage_stats['YOLO_active_pass']['mean_ms']:.2f}", f"{97.00 / max(0.01, stage_stats['YOLO_active_pass']['mean_ms']):.2f}x faster"])
+        w.writerow(["steer_ge15_pct", f"{b_data.get('steer_ge15_pct_before', 12.0):.1f}%", f"{sat_15_pct:.1f}%", f"{sat_15_pct - b_data.get('steer_ge15_pct_before', 12.0):+.1f}%"])
+        w.writerow(["steer_ge20_pct", f"{b_data.get('steer_ge20_pct_before', 8.0):.1f}%", f"{sat_20_pct:.1f}%", f"{sat_20_pct - b_data.get('steer_ge20_pct_before', 8.0):+.1f}%"])
+        w.writerow(["steer_saturation_pct", f"{b_data.get('steer_saturation_pct_before', 0.0):.1f}%", f"{sat_29_pct:.1f}%", f"{sat_29_pct - b_data.get('steer_saturation_pct_before', 0.0):+.1f}%"])
+        w.writerow(["mean_detections", f"{b_data.get('mean_detections', 1.52):.2f}", f"{mean_dets:.2f}", f"{mean_dets - b_data.get('mean_detections', 1.52):+.2f}"])
+        w.writerow(["fallback_pct", f"{b_data.get('fallback_pct', 22.3):.1f}%", f"{fb_pct:.1f}%", f"{fb_pct - b_data.get('fallback_pct', 22.3):+.1f}%"])
 
     # Write run_summary.txt to out_dir_path
     summary_path = out_dir_path / "run_summary.txt"
@@ -1470,16 +1571,20 @@ def run_video(
         f"Segmentation Rate:  Every {inf.get('seg_every', 1)} frame(s)",
         f"Detector Cadence:   Every {inf['detector'].get('every_n')} frames ({inf['detector'].get('weights')} @ imgsz {inf['detector'].get('imgsz')})",
         "-----------------------------------------------------------------",
-        f"Average FPS:        {avg_fps:.2f} (Baseline: {b_data.get('avg_fps', 7.04):.2f})",
-        f"P95 FPS:            {p95_fps:.2f} (Baseline: {b_data.get('p95_fps', 6.80):.2f})",
-        f"Trust (min/mean/max): {t_min:.3f} / {t_mean:.3f} / {t_max:.3f} (Baseline: {b_data.get('trust_min', 0.279):.3f} / {b_data.get('trust_mean', 0.760):.3f} / {b_data.get('trust_max', 0.921):.3f})",
-        f"FALLBACK frames:    {fb_pct:.1f}% (Baseline: {b_data.get('fallback_pct', 3.3):.1f}%)",
-        f"Obstacle Flag:      {obs_pct:.1f}% (Baseline: {b_data.get('obstacle_flag_pct', 50.0):.1f}%)",
-        f"Detections / Frame: {mean_dets:.2f} (Baseline: {b_data.get('mean_detections', 1.99):.2f})",
+        f"Average FPS:        {avg_fps:.2f} (Baseline: {b_data.get('avg_fps', 11.18):.2f})",
+        f"P95 FPS:            {p95_fps:.2f} (Baseline: {b_data.get('p95_fps', 7.52):.2f})",
+        f"Trust (min/mean/max): {t_min:.3f} / {t_mean:.3f} / {t_max:.3f} (Baseline: {b_data.get('trust_min', 0.049):.3f} / {b_data.get('trust_mean', 0.684):.3f} / {b_data.get('trust_max', 0.928):.3f})",
+        f"FALLBACK frames:    {fb_pct:.1f}% (Baseline: {b_data.get('fallback_pct', 22.3):.1f}%)",
+        f"Estimator Switches: {est_switches}",
+        f"Obstacle Flag:      {obs_pct:.1f}% (Baseline: {b_data.get('obstacle_flag_pct', 40.0):.1f}%)",
+        f"Detections / Frame: {mean_dets:.2f} (Baseline: {b_data.get('mean_detections', 1.52):.2f})",
         f"Frames 0 Detections: {zero_det_pct:.1f}% ({zero_det_count}/{total_pkts})",
         f"Steering == 0.0 deg: {steer_zero_pct:.1f}% ({steer_zero_count}/{total_pkts})",
-        f"Steering (|angle| >= 20 deg): {sat_20_pct:.1f}% (Baseline: {b_data.get('steer_ge20_pct_before', 54.3):.1f}%)",
-        f"Steering Saturation (|angle| >= 29.5 deg): {sat_29_pct:.1f}% (Baseline: {b_data.get('steer_saturation_pct_before', 51.7):.1f}%)",
+        f"Steering (|angle| >= 15 deg): {sat_15_pct:.1f}% (Baseline: {b_data.get('steer_ge15_pct_before', 12.0):.1f}%)",
+        f"Steering (|angle| >= 20 deg): {sat_20_pct:.1f}% (Baseline: {b_data.get('steer_ge20_pct_before', 8.0):.1f}%)",
+        f"Steering Saturation (|angle| >= 29.5 deg): {sat_29_pct:.1f}% (Baseline: {b_data.get('steer_saturation_pct_before', 0.0):.1f}%)",
+        f"Speed == 0.0 m/s:   {speed_zero_pct:.1f}% ({speed_zero_count}/{total_pkts})",
+        f"Frames Model >150ms:{model_gt_150}",
         f"Path/Steer Sign Agreement: {sign_agree_pct:.1f}%",
         f"Mode Switches:      {mode_switches} (Current: {pipeline.current_mode})",
         "-----------------------------------------------------------------",
