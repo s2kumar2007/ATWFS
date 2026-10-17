@@ -1,0 +1,36 @@
+{
+  "split": "held-out-test",
+  "resolution": "288x512",
+  "evaluated_samples": 250,
+  "total_test_samples": 1052,
+  "teacher": {
+    "mIoU": 0.6084166700801552,
+    "iou_nondrivable": 0.4803459983925362,
+    "iou_drivable": 0.7364873417677741,
+    "dirt_drivable_iou": 0.7435453001275089,
+    "ECE": 0.01446317957139019,
+    "mean_uncertainty": 0.06875714496523141,
+    "dirt_samples": 198,
+    "total_samples": 250
+  },
+  "student": {
+    "mIoU": 0.5776941789124772,
+    "iou_nondrivable": 0.48673520280618343,
+    "iou_drivable": 0.6686531550187711,
+    "dirt_drivable_iou": 0.654721255766509,
+    "ECE": 0.024388291863551185,
+    "mean_uncertainty": 0.07753843362629413,
+    "dirt_samples": 198,
+    "total_samples": 250
+  },
+  "student_onnx": {
+    "mIoU": 0.5776946182509481,
+    "iou_nondrivable": 0.4867346521422722,
+    "iou_drivable": 0.668654584359624,
+    "dirt_drivable_iou": 0.6547218543094792,
+    "ECE": 0.02438872558193678,
+    "mean_uncertainty": 0.07753853711485863,
+    "dirt_samples": 198,
+    "total_samples": 250
+  }
+}

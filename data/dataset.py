@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Protocol, Tuple
 import cv2
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from data.augment import StandardAugment, SyntheticConditionAugment
 from data.labels import collapse_to_binary, ids_to_mask
@@ -16,6 +16,28 @@ from data.synthetic import SyntheticSource
 from utils.config import resolve_path
 
 logger = logging.getLogger(__name__)
+
+
+def letterbox_pair(img: np.ndarray, raw: np.ndarray, target_size: Tuple[int, int],
+                   ignore_label: int = 255) -> Tuple[np.ndarray, np.ndarray]:
+    """Resize image and raw mask with aspect ratio preserved, centering with padding."""
+    mh, mw = target_size
+    fh, fw = img.shape[:2]
+    if (fh, fw) == (mh, mw):
+        return img, raw
+    scale = min(mw / fw, mh / fh)
+    nw, nh = int(round(fw * scale)), int(round(fh * scale))
+    small_img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+    small_raw = cv2.resize(raw, (nw, nh), interpolation=cv2.INTER_NEAREST)
+    if (nw, nh) == (mh, mw):
+        return small_img, small_raw
+    pad_top = (mh - nh) // 2
+    pad_left = (mw - nw) // 2
+    padded_img = np.zeros((mh, mw, 3), dtype=np.uint8)
+    padded_raw = np.full((mh, mw), ignore_label, dtype=np.uint8)
+    padded_img[pad_top:pad_top + nh, pad_left:pad_left + nw] = small_img
+    padded_raw[pad_top:pad_top + nh, pad_left:pad_left + nw] = small_raw
+    return padded_img, padded_raw
 
 
 class SampleSource(Protocol):
@@ -131,6 +153,7 @@ class DrivableDataset(Dataset):
         self.std = np.asarray(d["imagenet_std"], np.float32)
         self.std_aug = StandardAugment(cfg["augmentation"]["standard"], seed)
         self.syn_aug = SyntheticConditionAugment(cfg["augmentation"]["synthetic"], seed + 1)
+        self.letterbox = bool(d.get("letterbox", True))
 
     def __len__(self) -> int:
         """Return the dataset length."""
@@ -157,8 +180,11 @@ class DrivableDataset(Dataset):
         img, raw, terrain = self.source.load(i)
         h, w = self.size
         if img.shape[:2] != (h, w):
-            img = cv2.resize(img, (w, h), interpolation=cv2.INTER_LINEAR)
-            raw = cv2.resize(raw, (w, h), interpolation=cv2.INTER_NEAREST)
+            if self.letterbox:
+                img, raw = letterbox_pair(img, raw, (h, w), self.ignore_label)
+            else:
+                img = cv2.resize(img, (w, h), interpolation=cv2.INTER_LINEAR)
+                raw = cv2.resize(raw, (w, h), interpolation=cv2.INTER_NEAREST)
         mask = collapse_to_binary(raw, self.drivable_ids)
         obst = ids_to_mask(raw, self.obstacle_ids)
         valid = (raw != self.ignore_label).astype(np.uint8)  # 0 where annotators left the pixel unlabeled
@@ -222,7 +248,21 @@ def build_dataloader(ds: Dataset, cfg: Dict[str, Any], shuffle: bool, batch_size
     g = torch.Generator()
     g.manual_seed(cfg["seed"])
     nw = int(cfg["data"]["num_workers"])
+    sampler = None
+    if shuffle and cfg.get("data", {}).get("class_balanced", False):
+        weights_file = resolve_path("data/splits/train_weights.json")
+        if weights_file.exists() and hasattr(ds, "source") and hasattr(ds.source, "files"):
+            try:
+                import json
+                with open(weights_file, "r") as f:
+                    w_dict = json.load(f)
+                weights = [w_dict.get(ip.name, {}).get("weight", 1.0) for ip, _ in ds.source.files]
+                if len(weights) == len(ds):
+                    sampler = WeightedRandomSampler(weights, num_samples=len(ds), replacement=True)
+                    shuffle = False
+            except Exception:
+                sampler = None
     return DataLoader(ds, batch_size=batch_size or cfg["train"]["batch_size"], shuffle=shuffle,
-                      num_workers=nw, worker_init_fn=_seed_worker, generator=g,
+                      sampler=sampler, num_workers=nw, worker_init_fn=_seed_worker, generator=g,
                       pin_memory=torch.cuda.is_available(), drop_last=False,
                       persistent_workers=nw > 0)

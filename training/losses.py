@@ -92,11 +92,14 @@ def evidential_loss(alpha: torch.Tensor, target: torch.Tensor, kl_coef: float) -
     y = F.one_hot(target, k).permute(0, 3, 1, 2).to(alpha.dtype)
     s = alpha.sum(dim=1, keepdim=True)
     fit = (y * (torch.digamma(s) - torch.digamma(alpha))).sum(dim=1).mean()
+    fit = torch.clamp(fit, min=0.0)
     a_t = y + (1 - y) * alpha
     s_t = a_t.sum(dim=1, keepdim=True)
     kl = (torch.lgamma(s_t.squeeze(1)) - math_lgamma_k(k, alpha) - torch.lgamma(a_t).sum(dim=1)
           + ((a_t - 1) * (torch.digamma(a_t) - torch.digamma(s_t))).sum(dim=1)).mean()
-    return fit + kl_coef * kl, fit
+    kl = torch.clamp(kl, min=0.0)
+    total_evid = torch.clamp(fit + kl_coef * kl, min=0.0)
+    return total_evid, fit
 
 
 def math_lgamma_k(k: int, ref: torch.Tensor) -> torch.Tensor:
@@ -124,6 +127,8 @@ def terrain_ce(logits: torch.Tensor, target: torch.Tensor, ignore_index: int = -
         Scalar loss.
     """
     valid = target != ignore_index
+    if not valid.any():
+        return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
     ce = F.cross_entropy(logits, target.clamp(min=0), reduction="none")
     return (ce * valid).sum() / valid.sum().clamp(min=1)
 
@@ -160,25 +165,53 @@ class MultiTaskLoss(nn.Module):
         if bw is None:
             bw = batch_boundary_weights(y, c["boundary"]["w0"], c["boundary"]["sigma"])
         ce_map = F.cross_entropy(logits, y, reduction="none")
-        l_ce, l_dice = ce_map.mean(), dice_loss(logits, y)
-        l_bnd = (ce_map * bw).sum() / bw.sum()
-        l_aux = sum(F.cross_entropy(F.interpolate(a, size=y.shape[-2:], mode="bilinear", align_corners=False), y)
-                    for a in out["aux_logits"]) / len(out["aux_logits"])
-        l_seg = l_ce + c["dice_weight"] * l_dice + l_bnd + c["aux_weight"] * l_aux
+        l_ce = torch.clamp(ce_map.mean(), min=0.0)
+        l_dice = torch.clamp(dice_loss(logits, y), min=0.0)
+        l_bnd = torch.clamp((ce_map * bw).sum() / bw.sum().clamp(min=1e-6), min=0.0)
+        if len(out.get("aux_logits", [])) > 0:
+            l_aux = sum(F.cross_entropy(F.interpolate(a, size=y.shape[-2:], mode="bilinear", align_corners=False), y)
+                        for a in out["aux_logits"]) / len(out["aux_logits"])
+            l_aux = torch.clamp(l_aux, min=0.0)
+        else:
+            l_aux = torch.tensor(0.0, device=logits.device)
+        l_seg = torch.clamp(l_ce + c["dice_weight"] * l_dice + l_bnd + c["aux_weight"] * l_aux, min=0.0)
+        
         anneal = max(1, int(c["evidential_kl_anneal_epochs"]))
         kl_coef = min(1.0, self.epoch / anneal)
         l_evid, l_fit = evidential_loss(out["alpha"], y, kl_coef)
-        l_terr = terrain_ce(out["terrain_logits"], batch["terrain"], c["terrain_ignore_index"])
-        losses = torch.stack([l_seg, l_evid, l_terr])
+        l_evid = torch.clamp(l_evid, min=0.0)
         
-        clamped_log_vars = torch.clamp(self.log_vars, -2.0, 2.0)
         valid_terrain = (batch["terrain"] != c["terrain_ignore_index"]).any()
-        valid_mask = torch.tensor([True, True, valid_terrain.item()], device=self.log_vars.device)
+        l_terr = torch.clamp(terrain_ce(out["terrain_logits"], batch["terrain"], c["terrain_ignore_index"]), min=0.0)
         
-        total = (torch.exp(-clamped_log_vars[valid_mask]) * losses[valid_mask] + clamped_log_vars[valid_mask] + 2.0).sum()
+        # Clamp log_vars strictly to [-2.0, 2.0]
+        clamped_log_vars = torch.clamp(self.log_vars, -2.0, 2.0)
         
-        info = {"loss": float(total.detach()), "seg": float(l_seg.detach()), "ce": float(l_ce.detach()),
-                "dice": float(l_dice.detach()), "boundary": float(l_bnd.detach()), "aux": float(l_aux.detach()),
-                "evidence": float(l_evid.detach()), "terrain": float(l_terr.detach()),
-                **{f"w_{n}": float(torch.exp(-clamped_log_vars[i]).detach()) for i, n in enumerate(self.TASKS)}}
+        # Non-negative terms: exp(-s) * L + (s + 2.0) >= 0 since s >= -2 => s + 2 >= 0 and L >= 0
+        term_seg = torch.exp(-clamped_log_vars[0]) * l_seg + (clamped_log_vars[0] + 2.0)
+        term_evid = torch.exp(-clamped_log_vars[1]) * l_evid + (clamped_log_vars[1] + 2.0)
+        if valid_terrain:
+            term_terr = torch.exp(-clamped_log_vars[2]) * l_terr + (clamped_log_vars[2] + 2.0)
+        else:
+            term_terr = 0.0 * out["terrain_logits"].sum()
+            
+        total = term_seg + term_evid + term_terr
+        total = torch.clamp(total, min=1e-4)
+        
+        info = {
+            "loss": float(total.detach()),
+            "seg": float(l_seg.detach()),
+            "ce": float(l_ce.detach()),
+            "dice": float(l_dice.detach()),
+            "boundary": float(l_bnd.detach()),
+            "aux": float(l_aux.detach()),
+            "evidence": float(l_evid.detach()),
+            "terrain": float(l_terr.detach()),
+            "w_seg": float(torch.exp(-clamped_log_vars[0]).detach()),
+            "w_evidence": float(torch.exp(-clamped_log_vars[1]).detach()),
+            "w_terrain": float(torch.exp(-clamped_log_vars[2]).detach()),
+            "term_seg": float(term_seg.detach()),
+            "term_evid": float(term_evid.detach()),
+            "term_terr": float(term_terr.detach()),
+        }
         return total, info

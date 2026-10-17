@@ -17,6 +17,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import collections
 import csv
 import json
 import logging
@@ -199,9 +200,12 @@ def run_training(cfg: Dict[str, Any], model: nn.Module, criterion: MultiTaskLoss
         start_ep = ckpt.get("epoch", -1) + 1
         for _ in range(start_ep):
             sched.step()
+    patience_counter = 0
+    early_stopping_patience = int(t.get("early_stopping_patience", 10))
     for ep in range(start_ep, epochs):
         model.train(); criterion.set_epoch(ep)
         t0, run, n = time.time(), 0.0, 0
+        term_sums = collections.defaultdict(float)
         for it, batch in enumerate(train_loader):
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             batch["bweight"] = batch_boundary_weights(batch["mask"], cfg["loss"]["boundary"]["w0"], cfg["loss"]["boundary"]["sigma"])
@@ -220,19 +224,30 @@ def run_training(cfg: Dict[str, Any], model: nn.Module, criterion: MultiTaskLoss
             nn.utils.clip_grad_norm_(params, t["grad_clip"])
             scaler.step(opt); scaler.update()
             run += float(loss.detach()); n += 1
+            for k_term, v_term in info.items():
+                term_sums[k_term] += float(v_term)
             if it % t["log_every"] == 0:
                 logger.info("[%s] ep %d it %d loss %.4f", tag, ep, it, float(loss.detach()))
         sched.step()
         val = evaluate(model, val_loader, device, criterion, t["ece_bins"])
-        rec = {"epoch": ep, "train_loss": run / max(1, n), "time_s": time.time() - t0, **val}
+        mean_terms = {f"train_{k_term}": v_term / max(1, n) for k_term, v_term in term_sums.items()}
+        rec = {"epoch": ep, "train_loss": run / max(1, n), "time_s": time.time() - t0, **mean_terms, **val}
         history.append(rec)
-        logger.info("[%s] epoch %d | train_loss %.4f | val_loss %.4f | mIoU %.4f | terrain_acc %.3f | ECE %.4f",
-                    tag, ep, rec["train_loss"], val["val_loss"], val["miou"], val["terrain_acc"], val["ece"])
+        logger.info("[%s] epoch %d | train_loss %.4f (seg=%.4f evid=%.4f terr=%.4f) | val_loss %.4f | mIoU %.4f | drivable_IoU %.4f | ECE %.4f",
+                    tag, ep, rec["train_loss"], mean_terms.get("train_seg", 0.0), mean_terms.get("train_evidence", 0.0),
+                    mean_terms.get("train_terrain", 0.0), val["val_loss"], val["miou"], val.get("iou_drivable", float("nan")), val["ece"])
         save_checkpoint(last_path, model, criterion, opt, ep, val, model_cfg)
-        score = val["miou"] if not math.isnan(val["miou"]) else -val["val_loss"]
+        score = val.get("iou_drivable", val.get("miou", -val["val_loss"]))
         if score > best:
             best = score
+            patience_counter = 0
             save_checkpoint(best_path, model, criterion, opt, ep, val, model_cfg)
+        else:
+            patience_counter += 1
+            if patience_counter >= early_stopping_patience:
+                logger.info("[%s] Early stopping triggered at epoch %d (patience=%d, best drivable IoU=%.4f)",
+                            tag, ep, early_stopping_patience, best)
+                break
     _write_curves(history, report_dir, tag)
     return {"history": history, "best_path": str(best_path), "last_path": str(last_path)}
 

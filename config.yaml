@@ -7,8 +7,10 @@ paths:
   weights_url: ""
 data:
   image_size:
-  - 256
-  - 256
+  - 288
+  - 512
+  letterbox: true
+  class_balanced: true
   num_workers: 0
   image_suffix: _leftImg8bit.png
   mask_suffix: _gtFine_labellevel3Ids.png
@@ -109,17 +111,18 @@ loss:
     sigma: 5.0
   aux_weight: 0.4
   evidential_kl_anneal_epochs: 10
-  evidence_clip: 1000.0
+  evidence_clip: 20.0
   terrain_ignore_index: -1
 train:
   epochs: 50
-  batch_size: 2
+  batch_size: 16
   lr: 0.001
   weight_decay: 0.0001
   grad_clip: 5.0
   amp: true
   log_every: 20
   ece_bins: 15
+  early_stopping_patience: 10
 distill:
   epochs: 30
   temperature: 2.0

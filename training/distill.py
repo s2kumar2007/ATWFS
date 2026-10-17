@@ -126,9 +126,10 @@ def main() -> None:
     ap.add_argument("--synthetic", action="store_true")
     ap.add_argument("--teacher", default=None)
     ap.add_argument("--epochs", type=int, default=None)
+    ap.add_argument("--tag", default="student", help="Checkpoint name prefix (e.g. student_v2)")
     a = ap.parse_args()
     setup_logging()
-    res = train_distill(load_config(a.config), a.synthetic, a.teacher, a.epochs)
+    res = train_distill(load_config(a.config), a.synthetic, a.teacher, a.epochs, a.tag)
     logger.info("Done. Student checkpoint: %s", res["best_path"])
 
 
