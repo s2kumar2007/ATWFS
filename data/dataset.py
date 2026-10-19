@@ -1,6 +1,7 @@
 """Datasets: real IDD (official splits) and synthetic, sharing one processing pipeline."""
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Tuple
@@ -233,13 +234,90 @@ def _seed_worker(worker_id: int) -> None:
         info.dataset.reseed(int(torch.initial_seed() % 2**31) + worker_id)
 
 
+def _load_class_weights(ds: Dataset, weights_file: Path) -> Optional[list]:
+    """Load per-sample weights from train_weights.json using name_mapping.json.
+
+    train_weights.json keys are Image_N.png (original archive names).
+    name_mapping.json maps Image_N.png -> drive/stem_leftImg8bit.png.
+    IDDSource.files is a list of (image_path, mask_path) where image_path.name
+    is stem_leftImg8bit.png.  We invert the mapping to go stem_name -> weight.
+    """
+    if not weights_file.exists():
+        logger.warning("train_weights.json not found at %s; no class balancing.", weights_file)
+        return None
+    if not (hasattr(ds, "source") and hasattr(ds.source, "files")):
+        return None
+
+    mapping_file = weights_file.parent / "name_mapping.json"
+    with open(weights_file, "r", encoding="utf-8") as f:
+        w_dict: Dict[str, Any] = json.load(f)
+
+    # Build reverse: converted_img_name -> weight & fallback_share
+    img_name_to_weight: Dict[str, float] = {}
+    img_name_to_share: Dict[str, float] = {}
+    if mapping_file.exists():
+        with open(mapping_file, "r", encoding="utf-8") as f:
+            name_map: Dict[str, str] = json.load(f)  # Image_N.png -> "d0000/000000_leftImg8bit.png"
+        for orig, converted in name_map.items():
+            converted_stem = Path(converted).name  # "000000_leftImg8bit.png"
+            entry = w_dict.get(orig)
+            if entry is not None:
+                img_name_to_weight[converted_stem] = float(entry.get("weight", 1.0))
+                if "fallback_share" in entry:
+                    img_name_to_share[converted_stem] = float(entry["fallback_share"])
+    else:
+        # Fallback: try Image_N.png direct match (if names were not converted)
+        for orig, entry in w_dict.items():
+            img_name_to_weight[orig] = float(entry.get("weight", 1.0))
+            if "fallback_share" in entry:
+                img_name_to_share[orig] = float(entry["fallback_share"])
+
+    weights = [img_name_to_weight.get(ip.name, 1.0) for ip, _ in ds.source.files]
+    shares = [img_name_to_share.get(ip.name, 0.0) for ip, _ in ds.source.files]
+    w_arr = np.asarray(weights, dtype=np.float32)
+    s_arr = np.asarray(shares, dtype=np.float32)
+    n_trivial = int((w_arr == 1.0).sum())
+    unweighted_share = float(np.mean(s_arr)) if len(s_arr) > 0 else 0.0
+    weighted_share = float(np.average(s_arr, weights=w_arr)) if len(s_arr) > 0 and w_arr.sum() > 0 else 0.0
+
+    stats = {
+        "min": float(w_arr.min()),
+        "mean": float(w_arr.mean()),
+        "max": float(w_arr.max()),
+        "std": float(w_arr.std()),
+        "without_sampling": unweighted_share,
+        "with_sampling": weighted_share,
+    }
+    setattr(ds, "weight_stats", stats)
+
+    logger.info(
+        "Class-balanced sampler: n=%d  weight min=%.3f  mean=%.3f  max=%.3f  trivial(1.0)=%d (%.1f%%)",
+        len(weights), float(w_arr.min()), float(w_arr.mean()), float(w_arr.max()),
+        n_trivial, 100.0 * n_trivial / max(1, len(weights)),
+    )
+    logger.info(
+        "Drivable-fallback share in training split: without_sampling=%.2f%%, with_sampling(expected)=%.2f%%",
+        unweighted_share * 100.0, weighted_share * 100.0,
+    )
+    if n_trivial == len(weights):
+        logger.warning("ALL weights are 1.0 – name_mapping.json may not match the converted files. "
+                       "Check that scripts/build_dataset_from_splits.py has been run.")
+    return weights
+
+
 def build_dataloader(ds: Dataset, cfg: Dict[str, Any], shuffle: bool, batch_size: Optional[int] = None) -> DataLoader:
     """Create a reproducible DataLoader.
+
+    When ``data.class_balanced`` is True and the training split is being loaded
+    (``shuffle=True``), a WeightedRandomSampler is built from
+    ``data/splits/train_weights.json`` using ``data/splits/name_mapping.json``
+    to translate between the raw Image_N.png names (keys in train_weights.json)
+    and the converted file names (values in the converted IDD layout).
 
     Args:
         ds: Dataset.
         cfg: Full config.
-        shuffle: Shuffle flag.
+        shuffle: Shuffle flag (True only for training).
         batch_size: Optional override.
 
     Returns:
@@ -247,22 +325,24 @@ def build_dataloader(ds: Dataset, cfg: Dict[str, Any], shuffle: bool, batch_size
     """
     g = torch.Generator()
     g.manual_seed(cfg["seed"])
-    nw = int(cfg["data"]["num_workers"])
+    nw = int(cfg["data"].get("num_workers", 0))
     sampler = None
     if shuffle and cfg.get("data", {}).get("class_balanced", False):
         weights_file = resolve_path("data/splits/train_weights.json")
-        if weights_file.exists() and hasattr(ds, "source") and hasattr(ds.source, "files"):
-            try:
-                import json
-                with open(weights_file, "r") as f:
-                    w_dict = json.load(f)
-                weights = [w_dict.get(ip.name, {}).get("weight", 1.0) for ip, _ in ds.source.files]
-                if len(weights) == len(ds):
-                    sampler = WeightedRandomSampler(weights, num_samples=len(ds), replacement=True)
-                    shuffle = False
-            except Exception:
-                sampler = None
-    return DataLoader(ds, batch_size=batch_size or cfg["train"]["batch_size"], shuffle=shuffle,
-                      sampler=sampler, num_workers=nw, worker_init_fn=_seed_worker, generator=g,
-                      pin_memory=torch.cuda.is_available(), drop_last=False,
-                      persistent_workers=nw > 0)
+        weights = _load_class_weights(ds, weights_file)
+        if weights is not None and len(weights) == len(ds):
+            sampler = WeightedRandomSampler(weights, num_samples=len(ds), replacement=True)
+            shuffle = False
+    return DataLoader(
+        ds,
+        batch_size=batch_size or cfg["train"]["batch_size"],
+        shuffle=shuffle,
+        sampler=sampler,
+        num_workers=nw,
+        worker_init_fn=_seed_worker,
+        generator=g,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=False,
+        persistent_workers=(nw > 0),
+    )
+

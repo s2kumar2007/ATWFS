@@ -206,9 +206,15 @@ def run_training(cfg: Dict[str, Any], model: nn.Module, criterion: MultiTaskLoss
         model.train(); criterion.set_epoch(ep)
         t0, run, n = time.time(), 0.0, 0
         term_sums = collections.defaultdict(float)
+        fallback_pix_sum = 0
+        total_valid_pix_sum = 0
         for it, batch in enumerate(train_loader):
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             batch["bweight"] = batch_boundary_weights(batch["mask"], cfg["loss"]["boundary"]["w0"], cfg["loss"]["boundary"]["sigma"])
+            # Track effective share of drivable-fallback pixels in sampled batches:
+            valid_mask = (batch["mask"] != cfg["data"]["ignore_label"])
+            fallback_pix_sum += int((batch["mask"] == 1).sum().item())
+            total_valid_pix_sum += int(valid_mask.sum().item())
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, enabled=use_amp):
                 out = model(batch["image"])
@@ -236,6 +242,18 @@ def run_training(cfg: Dict[str, Any], model: nn.Module, criterion: MultiTaskLoss
         logger.info("[%s] epoch %d | train_loss %.4f (seg=%.4f evid=%.4f terr=%.4f) | val_loss %.4f | mIoU %.4f | drivable_IoU %.4f | ECE %.4f",
                     tag, ep, rec["train_loss"], mean_terms.get("train_seg", 0.0), mean_terms.get("train_evidence", 0.0),
                     mean_terms.get("train_terrain", 0.0), val["val_loss"], val["miou"], val.get("iou_drivable", float("nan")), val["ece"])
+
+        # Log class balancing statistics and effective drivable-fallback share with/without sampling
+        w_stats = getattr(getattr(train_loader, "dataset", None), "weight_stats", None)
+        sampled_fallback_share = (fallback_pix_sum / max(1, total_valid_pix_sum))
+        if w_stats is not None:
+            logger.info(
+                "[%s] ep %d | class balance: weights(min=%.3f, mean=%.3f, max=%.3f, std=%.3f) | "
+                "drivable-fallback share: without_sampling=%.2f%%, with_sampling(expected)=%.2f%%, sampled_epoch=%.2f%%",
+                tag, ep, w_stats["min"], w_stats["mean"], w_stats["max"], w_stats["std"],
+                w_stats["without_sampling"] * 100.0, w_stats["with_sampling"] * 100.0,
+                sampled_fallback_share * 100.0,
+            )
         save_checkpoint(last_path, model, criterion, opt, ep, val, model_cfg)
         score = val.get("iou_drivable", val.get("miou", -val["val_loss"]))
         if score > best:
@@ -307,14 +325,27 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--tag", default="teacher")
     ap.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+    ap.add_argument("--num-workers", type=int, default=None,
+                    help="DataLoader num_workers override (Windows: use 4; Linux: use 8+)")
+    ap.add_argument("--batch-size-override", type=int, default=None,
+                    help="Override batch size from config (useful for OOM recovery)")
     a = ap.parse_args()
     setup_logging()
     if a.cpu_fallback:
         cfg = smoke_config(); a.synthetic = True; a.tag = "smoke"; a.epochs = cfg["smoke"]["epochs"]
     else:
         cfg = load_config(a.config)
-    res = train(cfg, a.synthetic, a.tag, a.epochs, a.resume)
-    logger.info("Done. Best checkpoint: %s", res["best_path"])
+    if a.num_workers is not None:
+        cfg["data"]["num_workers"] = a.num_workers
+    if a.batch_size_override is not None:
+        cfg["train"]["batch_size"] = a.batch_size_override
+    try:
+        res = train(cfg, a.synthetic, a.tag, a.epochs, a.resume)
+        logger.info("Done. Best checkpoint: %s", res["best_path"])
+    except torch.cuda.OutOfMemoryError as oom:
+        logger.error("CUDA Out of Memory during training: %s", oom)
+        import sys
+        sys.exit(2)
 
 
 if __name__ == "__main__":

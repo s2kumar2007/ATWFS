@@ -102,8 +102,67 @@ tests/                       Comprehensive unit and stage smoke tests
 | Fine-tune night decoder | `python -m training.finetune_night --checkpoint outputs/checkpoints/student_best.pt --synthetic` |
 | Train FusionNet & ablation CSV | `python -m training.fusion_train --checkpoint outputs/checkpoints/student_best.pt` |
 | Evaluate checkpoint (IDD protocol) | `python -m evaluation.evaluate --checkpoint outputs/checkpoints/student_best.pt` |
+| Full held-out test split evaluation | `python -m evaluation.test_split_eval --baseline-checkpoint outputs/checkpoints/student_best.pt --onnx outputs/checkpoints/student_v2.onnx` |
 | Compression benchmark | `python -m evaluation.benchmark` |
 | Cross-dataset BDD100K evaluation | `python -m evaluation.external_eval --bdd100k-dir /path/to/bdd100k --checkpoint outputs/checkpoints/student_best.pt` |
 | End-to-end reproduce (PowerShell) | `powershell -ExecutionPolicy Bypass -File scripts/reproduce.ps1 -Synthetic` |
+
+---
+
+## 4. GPU Training Pipeline (Scene-Disjoint Splits)
+
+To run training on another Windows laptop with an NVIDIA GPU or Linux/Colab/Kaggle machine:
+
+### A. One-Command Automated Pipeline
+The automated scripts perform: CUDA check -> 1-epoch smoke run (time estimation) -> teacher training (`teacher_v2`) -> student distillation (`student_v2`) -> ONNX export + 50-image verification (mask IoU $\ge$ 0.99) -> full test-split evaluation:
+
+**Windows PowerShell:**
+```powershell
+.\scripts\train_gpu.ps1 -DataSrc "D:\path\to\IDD_RESIZED" [-Resume]
+```
+
+**Linux / Colab / Kaggle (Bash):**
+```bash
+bash scripts/train_gpu.sh --data-src /path/to/IDD_RESIZED [--resume]
+```
+
+### B. Manual Step-by-Step Training Commands
+
+1. **Build Dataset from Scene-Disjoint Splits (4,878 train / 1,063 val / 1,052 test):**
+   ```bash
+   python scripts/build_dataset_from_splits.py --src /path/to/IDD_RESIZED --dst data/idd_converted --drivable-value 1
+   ```
+
+2. **Train Teacher Model (`teacher_v2`):**
+   ```bash
+   python -m training.train --config config.yaml --tag teacher_v2
+   ```
+
+3. **Distil Student Model (`student_v2`):**
+   ```bash
+   python -m training.distill --config config.yaml --teacher outputs/checkpoints/teacher_v2_best.pt --tag student_v2
+   ```
+
+4. **Export ONNX & Verify Numerical Equivalence (50 images):**
+   ```bash
+   python scripts/export_onnx.py --checkpoint outputs/checkpoints/student_v2_best.pt --output outputs/checkpoints/student_v2.onnx --verify --verify-n 50
+   ```
+
+5. **Evaluate Full Held-Out Test Split (288x512):**
+   ```bash
+   python -m evaluation.test_split_eval \
+       --checkpoint outputs/checkpoints/teacher_v2_best.pt \
+       --student-checkpoint outputs/checkpoints/student_v2_best.pt \
+       --onnx outputs/checkpoints/student_v2.onnx \
+       --baseline-checkpoint outputs/checkpoints/student_best.pt \
+       --output outputs/reports/final_eval.json
+   ```
+
+6. **Run Video Inference with New Model:**
+   ```bash
+   python -m inference.live --source dashcam_raw.mp4 --onnx-path outputs/checkpoints/student_v2.onnx
+   # Or with PyTorch checkpoint:
+   python -m inference.live --source dashcam_raw.mp4 --model-path outputs/checkpoints/student_v2_best.pt
+   ```
 
 > **Important Safeguard:** `inference/live.py` inspects the input video basename and refuses to run on already-annotated files (filenames containing `"result"` or `"annotated"`) unless `--force` is explicitly passed. Always test inference on raw dashcam video (`dashcam_raw.mp4`).

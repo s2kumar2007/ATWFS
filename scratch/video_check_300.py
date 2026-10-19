@@ -9,7 +9,9 @@ import numpy as np
 import torch
 import onnxruntime as ort
 
-REPO_DIR = Path(r"c:\Users\K\OneDrive\Documents\idd_drivable\idd_drivable")
+import argparse
+
+REPO_DIR = Path(__file__).resolve().parent.parent
 if str(REPO_DIR) not in sys.path:
     sys.path.insert(0, str(REPO_DIR))
 
@@ -22,12 +24,22 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("video_check_300")
 
 def main():
+    ap = argparse.ArgumentParser(description="Run 300-frame video check with ONNX model.")
+    ap.add_argument("--video", required=True, help="Path to input test video MP4 (required)")
+    ap.add_argument("--repo", default=str(REPO_DIR), help="Path to repository root")
+    ap.add_argument("--onnx", default="outputs/checkpoints/student_v2.onnx", help="Path to ONNX student model")
+    ap.add_argument("--out-dir", default="outputs/inference/check_frames_v4", help="Output directory")
+    args = ap.parse_args()
+
     print("=== Step 7: VIDEO CHECK (300 FRAMES) ===")
-    video_path = r"C:\Users\K\Downloads\WhatsApp Video 2026-10-12 at 6.18.52 AM.mp4"
-    out_dir = REPO_DIR / "outputs" / "inference" / "check_frames_v4"
+    video_path = args.video
+    if not Path(video_path).is_file():
+        sys.exit(f"ERROR: Video file not found at {video_path}")
+
+    out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     
-    cfg = load_config(str(REPO_DIR / "config.yaml"))
+    cfg = load_config(str(Path(args.repo) / "config.yaml"))
     inf = cfg["inference"]
     
     # Camera settings

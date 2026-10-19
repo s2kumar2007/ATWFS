@@ -16,13 +16,20 @@ from training.train import load_model_from_checkpoint
 from evaluation.evaluate import official_confusion, official_ious
 from data.dataset import build_dataloader, build_dataset
 
+import argparse
+
+ap = argparse.ArgumentParser(description="Evaluate student at 256x256 and 288x512")
+ap.add_argument("--checkpoint", default="outputs/checkpoints/student_best.pt")
+ap.add_argument("--data-src", default=None, help="Root of IDD_RESIZED (contains image_archive and mask_archive)")
+args = ap.parse_args()
+
 device = torch.device("cpu")
 cfg = load_config()
 
 # Load model
-model, ckpt = load_model_from_checkpoint("outputs/checkpoints/student_best.pt", device)
+model, ckpt = load_model_from_checkpoint(args.checkpoint, device)
 model.eval()
-print("Loaded student_best.pt")
+print(f"Loaded {args.checkpoint}")
 
 # (b) IDD Val split (synthetic IDD benchmark used in evaluation/evaluate.py)
 print("\n--- (b) IDD Val Split (AutoNUE protocol in evaluate.py) ---")
@@ -42,14 +49,15 @@ for size in [(256, 256), (288, 512)]:
     print(f"IDD Val (synthetic) @ {size[0]}x{size[1]}: mIoU = {miou:.4f} (drivable: {ious[1]:.4f}, non-drivable: {ious[0]:.4f})")
 
 # (a) Custom Val split (from archive 2 real images)
-print("\n--- (a) Custom Val Split (Real IDD archive 2) ---")
-img_dir = Path("c:/Users/K/Downloads/archive (2)/IDD_RESIZED/image_archive")
-mask_dir = Path("c:/Users/K/Downloads/archive (2)/IDD_RESIZED/mask_archive")
+if args.data_src and Path(args.data_src).is_dir():
+    print(f"\n--- (a) Custom Val Split (Real IDD: {args.data_src}) ---")
+    img_dir = Path(args.data_src) / "image_archive"
+    mask_dir = Path(args.data_src) / "mask_archive"
 
-all_imgs = sorted(list(img_dir.glob("*.png")))
-# Use validation partition: last 981 images
-val_imgs = all_imgs[-981:] if len(all_imgs) >= 981 else all_imgs[:200]
-print(f"Evaluating {len(val_imgs)} validation images from archive 2...")
+    all_imgs = sorted(list(img_dir.glob("*.png")))
+    # Use validation partition: last 981 images
+    val_imgs = all_imgs[-981:] if len(all_imgs) >= 981 else all_imgs[:200]
+    print(f"Evaluating {len(val_imgs)} validation images from {args.data_src}...")
 
 mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
 std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)

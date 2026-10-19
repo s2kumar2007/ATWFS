@@ -22,10 +22,20 @@ from utils.config import load_config, resolve_path
 from utils.seed import get_device, set_global_seed
 
 
+import argparse
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Measure baseline metrics on video.")
+    parser.add_argument("--video", type=str, default="dashcam_raw.mp4", help="Path to input video")
+    return parser.parse_args()
+
+
 def main() -> None:
-    video_path = r"C:\Users\K\Downloads\WhatsApp Video 2026-10-12 at 6.18.52 AM.mp4"
+    args = parse_args()
+    video_path = args.video
     if not Path(video_path).exists():
-        video_path = "dashcam_raw.mp4"
+        sys.exit(f"ERROR: Video file not found: {video_path}. Provide via --video <path>.")
 
     cfg = load_config("config.yaml")
     set_global_seed(cfg["seed"])

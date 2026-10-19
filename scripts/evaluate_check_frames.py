@@ -20,8 +20,19 @@ from inference.hood_calibration import calibrate_or_load_hood_polygon
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("eval_check_frames")
 
+import argparse
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate check frames on video.")
+    parser.add_argument("--video", type=str, default="dashcam_raw.mp4", help="Path to input video")
+    return parser.parse_args()
+
 def main():
-    video_path = r"C:\Users\K\Downloads\WhatsApp Video 2026-10-12 at 6.18.52 AM.mp4"
+    args = parse_args()
+    video_path = args.video
+    if not Path(video_path).exists():
+        logger.error(f"Video file not found: {video_path}. Provide via --video <path>.")
+        sys.exit(1)
     out_dir = Path("outputs/inference/check_frames_after")
     out_dir.mkdir(parents=True, exist_ok=True)
 

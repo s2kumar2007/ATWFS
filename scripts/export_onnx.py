@@ -43,6 +43,7 @@ def export_to_onnx(
     input_size: Tuple[int, int] = (288, 512),
     opset: int = 14,
     int8: bool = False,
+    data_src: Optional[str] = None,
 ) -> Path:
     device = torch.device("cpu")
     model, _ = load_model_from_checkpoint(checkpoint_path, device)
@@ -85,7 +86,9 @@ def export_to_onnx(
                     quantize_static,
                 )
 
-                calib_paths = sorted(list(Path("c:/Users/K/Downloads/archive (2)/IDD_RESIZED/image_archive").glob("*.png")))[:200]
+                calib_paths = []
+                if data_src:
+                    calib_paths = sorted(list((Path(data_src) / "image_archive").glob("*.png")))[:200]
                 if not calib_paths:
                     calib_paths = sorted(list(Path("data/idd_converted/leftImg8bit/train").glob("*/*_leftImg8bit.png")))[:200]
 
@@ -169,21 +172,100 @@ def export_openvino(onnx_model_path: str, output_dir: str) -> Optional[Path]:
         return None
 
 
+def verify_onnx(
+    checkpoint: str,
+    onnx_path: str,
+    data_src: Optional[str] = None,
+    n_samples: int = 50,
+    input_size: Tuple[int, int] = (288, 512),
+) -> None:
+    """Verify numerical equivalence between PyTorch and exported ONNX model."""
+    import cv2
+    import numpy as np
+    import onnxruntime as ort
+
+    device = torch.device("cpu")
+    model, _ = load_model_from_checkpoint(checkpoint, device)
+    model.eval()
+
+    sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+
+    h_in, w_in = input_size
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
+
+    imgs = []
+    if data_src and (Path(data_src) / "image_archive").is_dir():
+        imgs = sorted(list((Path(data_src) / "image_archive").glob("*.png")))[:n_samples]
+    if not imgs:
+        imgs = sorted(list(Path("data/idd_converted/leftImg8bit/test").glob("*/*.png")))[:n_samples]
+    if not imgs:
+        imgs = sorted(list(Path("data/idd_converted/leftImg8bit/val").glob("*/*.png")))[:n_samples]
+
+    max_diff_l = 0.0
+    max_diff_a = 0.0
+    mask_ious = []
+
+    logger.info("Verifying PyTorch vs ONNX on %d images at %dx%d...", max(len(imgs), n_samples), h_in, w_in)
+    with torch.no_grad():
+        for i in range(max(len(imgs), n_samples)):
+            if i < len(imgs):
+                bgr = cv2.imread(str(imgs[i]))
+            else:
+                bgr = np.random.randint(0, 256, (512, 512, 3), dtype=np.uint8)
+            resized = cv2.resize(bgr, (w_in, h_in), interpolation=cv2.INTER_LINEAR)
+            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+            x = (rgb.astype(np.float32) / 255.0 - mean) / std
+            chw = x.transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
+
+            py_out = model(torch.from_numpy(chw).to(device))
+            py_l = py_out["seg_logits"].numpy()
+            py_a = py_out["alpha"].numpy()
+            py_mask = np.argmax(py_l, axis=1)[0]
+
+            ox_l, ox_a = sess.run(None, {"image": chw})
+            ox_mask = np.argmax(ox_l, axis=1)[0]
+
+            max_diff_l = max(max_diff_l, float(np.max(np.abs(py_l - ox_l))))
+            max_diff_a = max(max_diff_a, float(np.max(np.abs(py_a - ox_a))))
+
+            inter = np.logical_and(py_mask == 1, ox_mask == 1).sum()
+            union = np.logical_or(py_mask == 1, ox_mask == 1).sum()
+            iou = 1.0 if union == 0 else float(inter / union)
+            mask_ious.append(iou)
+
+    mean_iou = float(np.mean(mask_ious))
+    min_iou = float(np.min(mask_ious))
+    logger.info(
+        "Numerical Verification (%d images): max abs diff logits=%.4e, alpha=%.4e, mean Mask IoU=%.6f, min Mask IoU=%.6f",
+        len(mask_ious), max_diff_l, max_diff_a, mean_iou, min_iou,
+    )
+    assert mean_iou >= 0.99, f"Mean Mask IoU {mean_iou:.6f} < 0.99"
+    assert min_iou >= 0.95, f"Min Mask IoU {min_iou:.6f} < 0.95"
+    logger.info("ONNX verification PASSED: mask IoU >= 0.99 threshold met.")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Export student model to ONNX and OpenVINO.")
     ap.add_argument("--checkpoint", default="outputs/checkpoints/student_best.pt")
     ap.add_argument("--output", default="outputs/checkpoints/student_best.onnx")
     ap.add_argument("--input-size", nargs=2, type=int, default=[288, 512], help="H W")
     ap.add_argument("--int8", action="store_true", help="Apply static INT8 calibration on 200 IDD train images")
+    ap.add_argument("--data-src", default=None, help="Root of IDD_RESIZED for calibration/verification")
+    ap.add_argument("--verify", action="store_true", help="Verify PyTorch vs ONNX on N images")
+    ap.add_argument("--verify-n", type=int, default=50, help="Number of images for numerical verification")
     ap.add_argument("--openvino", action="store_true", help="Export OpenVINO IR if openvino installed")
     args = ap.parse_args()
 
     setup_logging()
-    onnx_p = export_to_onnx(args.checkpoint, args.output, tuple(args.input_size), int8=args.int8)
+    onnx_p = export_to_onnx(args.checkpoint, args.output, tuple(args.input_size), int8=args.int8, data_src=args.data_src)
+    if args.verify:
+        verify_onnx(args.checkpoint, str(onnx_p), data_src=args.data_src, n_samples=args.verify_n, input_size=tuple(args.input_size))
     if args.openvino:
         export_openvino(str(onnx_p), str(Path(args.output).parent))
 
 
 if __name__ == "__main__":
     main()
+
 

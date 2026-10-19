@@ -9,9 +9,9 @@ data:
   image_size:
   - 288
   - 512
-  letterbox: true
+  letterbox: false
   class_balanced: true
-  num_workers: 0
+  num_workers: 4
   image_suffix: _leftImg8bit.png
   mask_suffix: _gtFine_labellevel3Ids.png
   ignore_label: 255
@@ -29,9 +29,9 @@ data:
   - 11
   - 12
   expected_split_sizes:
-    train: 6993
-    val: 981
-    test: 2029
+    train: 4878
+    val: 1063
+    test: 1052
   eval_split: val
   imagenet_mean:
   - 0.485

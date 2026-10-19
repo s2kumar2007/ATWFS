@@ -15,7 +15,15 @@ from training.train import load_model_from_checkpoint
 import onnxruntime
 import torch
 
-video_path = r"C:\Users\K\Downloads\WhatsApp Video 2026-10-12 at 6.18.52 AM.mp4"
+import argparse
+
+parser = argparse.ArgumentParser(description="Measure mask stability on video.")
+parser.add_argument("--video", type=str, default="dashcam_raw.mp4", help="Path to input video")
+args = parser.parse_args()
+
+video_path = args.video
+if not Path(video_path).exists():
+    sys.exit(f"ERROR: Video file not found: {video_path}. Provide via --video <path>.")
 cap = cv2.VideoCapture(video_path)
 
 cfg = load_config()

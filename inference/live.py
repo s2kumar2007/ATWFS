@@ -1195,7 +1195,12 @@ def run_video(
         try:
             import onnxruntime
             ck_path = Path(checkpoint) if checkpoint else resolve_path(inf["checkpoint"])
-            onnx_path = ck_path.with_suffix(".onnx")
+            # Support explicit --onnx-path override (injected as _onnx_path_override)
+            _onnx_override = inf.get("_onnx_path_override")
+            if _onnx_override:
+                onnx_path = Path(_onnx_override)
+            else:
+                onnx_path = ck_path.with_suffix(".onnx")
             if use_int8:
                 int8_p = ck_path.parent / f"{ck_path.stem}_int8.onnx"
                 if int8_p.is_file():
@@ -1648,6 +1653,10 @@ def main() -> None:
     ap.add_argument("--backend", choices=["torch", "onnx", "openvino"], default=None, help="Execution backend")
     ap.add_argument("--seg-every", type=int, default=None, help="Run segmentation every Nth frame")
     ap.add_argument("--out-dir", default=None, help="Directory for output reports and frames")
+    ap.add_argument("--model-path", default=None, dest="model_path",
+                    help="Explicit path to a PyTorch .pt checkpoint (overrides --checkpoint and config)")
+    ap.add_argument("--onnx-path", default=None, dest="onnx_path",
+                    help="Explicit path to a .onnx model (forces ONNX backend; no renaming needed)")
     a = ap.parse_args()
 
     setup_logging()
@@ -1655,11 +1664,23 @@ def main() -> None:
     if a.frame_skip:
         cfg["inference"]["frame_skip"] = a.frame_skip
     src = int(a.source) if a.source.isdigit() else a.source
+
+    # --model-path overrides --checkpoint; --onnx-path forces onnx backend
+    checkpoint_arg = a.model_path or a.checkpoint
+    backend_arg = a.backend
+    use_onnx_arg = a.onnx
+    if a.onnx_path:
+        # Override ONNX discovery: inject path into config so run_video picks it up
+        cfg.setdefault("inference", {})["_onnx_path_override"] = a.onnx_path
+        use_onnx_arg = True
+        if backend_arg is None:
+            backend_arg = "onnx"
+
     run_video(
         cfg=cfg,
         source=src,
         output_path=str(resolve_path(a.output)),
-        checkpoint=a.checkpoint,
+        checkpoint=checkpoint_arg,
         max_frames=a.max_frames,
         display=a.display or None,
         max_width=a.max_width,
@@ -1678,9 +1699,9 @@ def main() -> None:
         vfov_deg=a.vfov_deg,
         hood_polygon=a.hood_polygon,
         verbose=a.verbose,
-        use_onnx=a.onnx,
+        use_onnx=use_onnx_arg,
         use_int8=a.int8,
-        backend=a.backend,
+        backend=backend_arg,
         seg_every=a.seg_every,
         out_dir=a.out_dir,
     )
