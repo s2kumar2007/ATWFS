@@ -159,6 +159,11 @@ class ATWFS:
         """
         f = torch.tensor([[uncertainty, geometric, temporal]], dtype=torch.float32).clamp(0, 1)
         a = float(self.net(f, torch.tensor([terrain]))[0])
+        # High confidence deep learning safeguard:
+        # If evidential uncertainty is low (student model is confident), do not allow
+        # noisy classical Canny edge detection to override the deep learning mask.
+        if uncertainty < 0.25:
+            a = max(0.75, a)
         return float(min(1.0, max(0.0, a)))
 
     def fuse(self, dl_mask: np.ndarray, fallback_mask: np.ndarray, uncertainty: float, geometric: float,

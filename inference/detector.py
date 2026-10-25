@@ -345,7 +345,7 @@ class YOLODetector(ObstacleDetector):
             # Pass 2: Optional small-object road-band crop
             num_vehicles = sum(1 for d in dets if d.kind == "vehicle")
             should_run_crop = (self.crop_every_n > 0) and (
-                (frame_idx % self.crop_every_n == 0) or (num_vehicles < 2)
+                (frame_idx % self.crop_every_n == 0)
             )
 
             if should_run_crop:

@@ -11,7 +11,7 @@ data:
   - 512
   letterbox: false
   class_balanced: true
-  num_workers: 4
+  num_workers: 0
   image_suffix: _leftImg8bit.png
   mask_suffix: _gtFine_labellevel3Ids.png
   ignore_label: 255
@@ -265,7 +265,7 @@ inference:
   profiles:
     quality:
       detector_weights: yolov8s.pt
-      detector_imgsz: 960
+      detector_imgsz: 640
       detector_every_n: 3
       crop_every_n: 6
       crop_upscale: 2.0
@@ -308,7 +308,7 @@ inference:
     lookahead_rows:
     - 0.55
     - 0.9
-    lookahead_m: 4.0
+    lookahead_m: 8.0
     bev_height_m: 25.0
     wheelbase_m: 2.5
     steer_ema_alpha: 0.4

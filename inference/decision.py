@@ -38,6 +38,8 @@ class Command:
     path_y_range: Optional[Tuple[int, int]] = None
     lateral_target_dx: float = 0.0  # pixels, positive = target is right of ego centre
     held_angle: float = 0.0         # angle held/decayed during low-visibility
+    path_waypoints: Optional[np.ndarray] = None
+    path_y_evals: Optional[np.ndarray] = None
 
     @property
     def packet(self) -> str:
@@ -173,6 +175,7 @@ def compute_command(
     hold_count: int = 0,
     prev_speed: Optional[float] = None,
     ipm_valid: bool = False,
+    prev_waypoints: Optional[np.ndarray] = None,
 ) -> Command:
     h, w = mask.shape
     ego_center_px = w / 2.0
@@ -211,7 +214,7 @@ def compute_command(
     eval_area = max(1, (y_eval_end - y_eval_start) * int(0.6 * w))
     eval_roi = mask[y_eval_start:y_eval_end, int(0.2 * w):int(0.8 * w)]
     upper_frac = float(np.count_nonzero(eval_roi)) / float(eval_area)
-    if upper_frac < 0.10:
+    if upper_frac < 0.05:
         return _low_vis_command(
             trust=min(trust, 0.15), dets=dets, cfg=cfg,
             prev_angle=prev_angle, hold_count=hold_count,
@@ -231,17 +234,26 @@ def compute_command(
                 cx=cx,
             )
 
-    # 1. Extract per-row ego-lane centres across visible road band
-    c_pts: List[Tuple[float, float]] = []
-    step = max(1, (bottom_y - y_start) // 12)
-    for y in range(bottom_y, y_start - 1, -step):
+    px_to_m = float(cfg.get("bev_width_m", 10.0)) / max(1.0, float(w))
+    lane_width_m = float(cfg.get("max_ego_lane_width_m", 3.5))
+    lane_width_px = lane_width_m / max(1e-6, px_to_m)
+    lane_half_px = lane_width_px / 2.0
+
+    # 1. Extract per-row ego-lane waypoints across visible road band
+    n_pts = 16
+    y_evals = np.linspace(bottom_y, y_start, n_pts).astype(int)
+    curr_x = ego_center_px
+    raw_waypoints = []
+
+    for y in y_evals:
         row = mask[y]
-        nz = np.nonzero(row)[0]
+        nz = np.where(row > 0)[0]
         if len(nz) < 2:
+            raw_waypoints.append(curr_x)
             continue
         diffs = np.diff(nz)
-        split_pts = np.where(diffs > 1)[0] + 1
-        runs = np.split(nz, split_pts)
+        splits = np.where(diffs > 1)[0] + 1
+        runs = np.split(nz, splits)
 
         best_run = None
         min_dist = float("inf")
@@ -249,74 +261,65 @@ def compute_command(
             if len(r) == 0:
                 continue
             r_start, r_end = float(r[0]), float(r[-1])
-            if r_start <= ego_center_px <= r_end:
+            if r_start <= curr_x <= r_end:
                 best_run = r
                 break
-            d = min(abs(r_start - ego_center_px), abs(r_end - ego_center_px))
+            d = min(abs(r_start - curr_x), abs(r_end - curr_x))
             if d < min_dist:
                 min_dist = d
                 best_run = r
 
         if best_run is not None and len(best_run) > 0:
             r_start, r_end = float(best_run[0]), float(best_run[-1])
-            run_c = (r_start + r_end) / 2.0
-            c_pts.append((float(y), float(run_c)))
-
-    # Remove hooks/loops: filter monotonic in x
-    c_pts = _monotonic_path_pts(c_pts, ego_center_px)
-
-    # Fit degree-2 polynomial x(y) = a*y^2 + b*y + c through per-row ego-lane centres
-    poly_tuple: Optional[Tuple[float, float, float]] = None
-    if len(c_pts) >= 3:
-        y_arr = np.array([pt[0] for pt in c_pts], dtype=np.float64)
-        x_arr = np.array([pt[1] for pt in c_pts], dtype=np.float64)
-        try:
-            poly_deg = 2 if len(c_pts) >= 4 else 1
-            coeffs = np.polyfit(y_arr, x_arr, poly_deg)
-            if poly_deg == 1:
-                poly_tuple = (0.0, float(coeffs[0]), float(coeffs[1]))
+            r_w = r_end - r_start
+            r_center = (r_start + r_end) / 2.0
+            if r_w > 1.2 * lane_width_px:
+                # Smooth continuous transition based on road width
+                w_blend = min(1.0, max(0.0, (r_w - 1.2 * lane_width_px) / max(1.0, 0.8 * lane_width_px)))
+                ego_target = float(np.clip(curr_x, r_start + lane_half_px, r_end - lane_half_px))
+                target_x = (1.0 - w_blend) * r_center + w_blend * ego_target
             else:
-                poly_tuple = (float(coeffs[0]), float(coeffs[1]), float(coeffs[2]))
-        except Exception:
-            poly_tuple = None
+                target_x = r_center
+            curr_x = 0.65 * curr_x + 0.35 * target_x
+            raw_waypoints.append(curr_x)
+        else:
+            raw_waypoints.append(curr_x)
 
-    px_to_m = float(cfg.get("bev_width_m", 10.0)) / max(1.0, float(w))
+    raw_wp = np.array(raw_waypoints, dtype=np.float32)
 
-    # Fixed metric lookahead: evaluate target at the row corresponding to lookahead_m
+    # 2. Temporal exponential moving average on waypoints across frames
+    if prev_waypoints is not None and len(prev_waypoints) == len(raw_wp):
+        wp_alpha = float(cfg.get("trajectory_ema_alpha", 0.35))
+        smooth_wp = wp_alpha * raw_wp + (1.0 - wp_alpha) * np.array(prev_waypoints, dtype=np.float32)
+    else:
+        smooth_wp = raw_wp
+
+    # 3. Fit polynomial for smooth trajectory evaluation, legacy consumers, and obstacle checking
+    poly_tuple: Optional[Tuple[float, float, float]] = None
+    try:
+        poly_deg = 2 if len(smooth_wp) >= 4 else 1
+        coeffs = np.polyfit(y_evals, smooth_wp, poly_deg)
+        if poly_deg == 1:
+            poly_tuple = (0.0, float(coeffs[0]), float(coeffs[1]))
+        else:
+            poly_tuple = (float(coeffs[0]), float(coeffs[1]), float(coeffs[2]))
+    except Exception:
+        poly_tuple = None
+
+    # Evaluate smooth parabolic trajectory from polynomial fit
+    if poly_tuple is not None:
+        a_p, b_p, c_p = poly_tuple
+        traj_wp = a_p * (y_evals ** 2) + b_p * y_evals + c_p
+        traj_wp[0] = 0.6 * traj_wp[0] + 0.4 * ego_center_px
+    else:
+        traj_wp = smooth_wp
+
     lookahead_m = float(cfg.get("lookahead_m", 4.0))
     wheelbase_m = float(cfg.get("wheelbase_m", 2.5))
     max_steer = float(cfg.get("max_steer_deg", 30.0))
 
-    # Convert lookahead_m to image row (if IPM valid), else use 0.62 of road height
-    if ipm_valid and road_width_m is not None and road_width_m > 0.5:
-        # Use the IPM bev_resolution to estimate pixel-per-metre, fallback to simple factor
-        bev_height_m = float(cfg.get("bev_height_m", 25.0))
-        visible_road_px = max(1, bottom_y - y_start)
-        px_per_m_vertical = visible_road_px / max(1.0, bev_height_m)
-        lookahead_row = int(bottom_y - lookahead_m * px_per_m_vertical)
-    else:
-        # 0.62 of the visible road height from the bottom
-        visible_road_px = max(1, bottom_y - y_start)
-        lookahead_row = int(bottom_y - 0.62 * visible_road_px)
-
-    lookahead_row = max(y_start, min(bottom_y - 1, lookahead_row))
-
-    if poly_tuple is not None:
-        a_p, b_p, c_p = poly_tuple
-        x_bottom = a_p * (bottom_y ** 2) + b_p * bottom_y + c_p
-        # Target: the polynomial evaluated at the fixed-lookahead row
-        x_target = a_p * (lookahead_row ** 2) + b_p * lookahead_row + c_p
-        # Clamp to fitted y-range to prevent extrapolation hooks
-        y_min_fit = min(pt[0] for pt in c_pts)
-        y_max_fit = max(pt[0] for pt in c_pts)
-        lookahead_row_clipped = max(int(y_min_fit), min(int(y_max_fit), lookahead_row))
-        x_target = a_p * (lookahead_row_clipped ** 2) + b_p * lookahead_row_clipped + c_p
-        # Target lateral displacement from ego centre
-        delta_x = float(x_target - ego_center_px)
-    else:
-        x_bottom = cx
-        x_target = cx
-        delta_x = float(cx - ego_center_px)
+    # Lookahead target evaluated from smooth trajectory waypoints
+    delta_x = float(traj_wp[-1] - ego_center_px)
 
     # Width fraction at row just above hood
     row_idx = max(0, bottom_y - 5)
@@ -433,6 +436,8 @@ def compute_command(
         path_y_range=(y_start, bottom_y),
         lateral_target_dx=delta_x,
         held_angle=0.0,
+        path_waypoints=traj_wp,
+        path_y_evals=y_evals,
     )
 
 
@@ -559,4 +564,6 @@ def _low_vis_command(
         path_y_range=None,
         lateral_target_dx=0.0,
         held_angle=angle_deg,
+        path_waypoints=None,
+        path_y_evals=None,
     )

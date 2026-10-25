@@ -1,40 +1,40 @@
 =================================================================
-ATWFS INFERENCE RUN SUMMARY (300 FRAMES PROCESSED)
+ATWFS INFERENCE RUN SUMMARY (2219 FRAMES PROCESSED)
 =================================================================
 Backend:            onnx
-Device:             ONNX Runtime (student_best.onnx)
-Profile:            cpu
+Device:             ONNX Runtime (student_v2.onnx)
+Profile:            quality
 Segmentation Rate:  Every 1 frame(s)
-Detector Cadence:   Every 4 frames (yolov8n.pt @ imgsz 480)
+Detector Cadence:   Every 3 frames (yolov8s.pt @ imgsz 640)
 -----------------------------------------------------------------
-Average FPS:        12.91 (Baseline: 11.18)
-P95 FPS:            12.22 (Baseline: 7.52)
-Trust (min/mean/max): 0.049 / 0.612 / 0.928 (Baseline: 0.049 / 0.684 / 0.928)
-FALLBACK frames:    41.3% (Baseline: 22.3%)
-Estimator Switches: 5
-Obstacle Flag:      12.7% (Baseline: 40.0%)
-Detections / Frame: 2.19 (Baseline: 1.52)
-Frames 0 Detections: 0.0% (0/300)
-Steering == 0.0 deg: 0.0% (0/300)
-Steering (|angle| >= 15 deg): 9.3% (Baseline: 12.0%)
-Steering (|angle| >= 20 deg): 1.0% (Baseline: 8.0%)
+Average FPS:        13.15 (Baseline: 11.18)
+P95 FPS:            10.67 (Baseline: 7.52)
+Trust (min/mean/max): 0.150 / 0.706 / 0.912 (Baseline: 0.049 / 0.684 / 0.928)
+FALLBACK frames:    20.1% (Baseline: 22.3%)
+Estimator Switches: 16
+Obstacle Flag:      26.7% (Baseline: 40.0%)
+Detections / Frame: 1.76 (Baseline: 1.52)
+Frames 0 Detections: 23.6% (523/2219)
+Steering == 0.0 deg: 0.0% (0/2219)
+Steering (|angle| >= 15 deg): 0.0% (Baseline: 12.0%)
+Steering (|angle| >= 20 deg): 0.0% (Baseline: 8.0%)
 Steering Saturation (|angle| >= 29.5 deg): 0.0% (Baseline: 0.0%)
-Speed == 0.0 m/s:   2.0% (6/300)
+Speed == 0.0 m/s:   6.0% (133/2219)
 Frames Model >150ms:0
-Path/Steer Sign Agreement: 81.0%
+Path/Steer Sign Agreement: 81.5%
 Mode Switches:      0 (Current: day)
 -----------------------------------------------------------------
 PER-STAGE TIMINGS TABLE (ms):
 Stage                | Mean (ms)  | P95 (ms)   | Total (s) 
 -----------------------------------------------------------------
-read                 | 2.15       | 3.16       | 0.64      
-preprocess           | 1.18       | 2.72       | 0.35      
-model                | 47.23      | 54.18      | 14.17     
-classical            | 6.44       | 18.51      | 1.93      
-YOLO (per-frame)     | 1.34       | 2.13       | 0.40      
-IPM                  | 1.82       | 12.91      | 0.55      
-postprocess          | 2.50       | 3.14       | 0.75      
-annotate             | 9.16       | 13.07      | 2.75      
-write                | 4.63       | 6.15       | 1.39      
-YOLO (active pass)   | 83.02      | 144.12     | 6.23      
+read                 | 0.92       | 1.89       | 2.05      
+preprocess           | 1.33       | 2.89       | 2.95      
+model                | 54.85      | 69.71      | 121.70    
+classical            | 5.91       | 19.27      | 13.12     
+YOLO (per-frame)     | 1.51       | 2.47       | 3.35      
+IPM                  | 2.61       | 12.87      | 5.80      
+postprocess          | 1.50       | 2.02       | 3.34      
+annotate             | 11.81      | 15.86      | 26.20     
+write                | 5.25       | 6.80       | 11.65     
+YOLO (active pass)   | 65.72      | 101.65     | 48.50     
 =================================================================

@@ -1,3 +1,4 @@
+import json
 import os
 import argparse
 import collections
@@ -45,6 +46,7 @@ class FrameResult:
     ipm: Optional[IPMResult] = None
     mode: str = "day"
     mask_model: Optional[np.ndarray] = None
+    prob_model: Optional[np.ndarray] = None
 
 
 class LivePipeline:
@@ -95,6 +97,7 @@ class LivePipeline:
         else:
             self.hood_poly_norm = None
         self.hood_poly_model: Optional[np.ndarray] = None
+        self.prev_prob_crop: Optional[np.ndarray] = None
         self._last_road_color = [128, 128, 128]
         self.prev_speed: Optional[float] = None
 
@@ -113,6 +116,7 @@ class LivePipeline:
         # Steering history for rate limiting and EMA
         self.prev_steer_angle: Optional[float] = None
         self.steer_hold_counter = 0
+        self.prev_waypoints: Optional[np.ndarray] = None
         self.consec_ious: List[float] = []
         self._prev_fused_mask: Optional[np.ndarray] = None
 
@@ -132,6 +136,7 @@ class LivePipeline:
         # Segmentation skipping cadence
         self.seg_every = max(1, int(inf_cfg.get("seg_every", 2 if profile_name == "cpu" else 1)))
         self.last_raw_mask: Optional[np.ndarray] = None
+        self.last_prob_smooth: Optional[np.ndarray] = None
         self.last_fused_alpha: float = 1.0
         self.last_active: str = "DL"
         self.last_unc: float = 0.05
@@ -277,6 +282,7 @@ class LivePipeline:
 
         if skip_seg:
             mask = self.last_raw_mask.copy()
+            prob_smooth = self.last_prob_smooth.copy() if self.last_prob_smooth is not None else mask.astype(np.float32)
             unc = self.last_unc
             geo = self.last_geo
             tmp = self.last_tmp
@@ -303,7 +309,9 @@ class LivePipeline:
                     ent = -np.sum(probs * np.log(probs + 1e-6), axis=1) / log_k
                     unc = float(np.mean(ent))
 
-                dl_mask_padded = np.argmax(seg_logits_np, axis=1)[0].astype(np.uint8)
+                logit_diff = seg_logits_np[0, 1] - seg_logits_np[0, 0]
+                prob_road_padded = 1.0 / (1.0 + np.exp(-logit_diff))
+                dl_mask_padded = (prob_road_padded >= 0.50).astype(np.uint8)
                 terrain = 0
 
                 t_mod_ms = (time.perf_counter() - t_stage0) * 1000.0
@@ -336,7 +344,9 @@ class LivePipeline:
                         ent = (-(probs * torch.log(probs + 1e-6)).sum(dim=1) / log_k).mean()
                         unc = float(ent.item())
 
-                    dl_mask_padded = seg_logits.argmax(1)[0].byte().cpu().numpy()
+                    logit_diff = (seg_logits[0, 1] - seg_logits[0, 0]).cpu().numpy()
+                    prob_road_padded = 1.0 / (1.0 + np.exp(-logit_diff))
+                    dl_mask_padded = (prob_road_padded >= 0.50).astype(np.uint8)
                     if self.cfg["inference"].get("use_terrain", False) and "terrain_logits" in out:
                         terrain = int(out["terrain_logits"].argmax(1)[0].item())
                     else:
@@ -348,11 +358,25 @@ class LivePipeline:
                 self.timings["model"] += t_mod_ms / 1000.0
                 self.stage_samples["model"].append(t_mod_ms)
             else:
+                prob_road_padded = np.zeros((mh, mw), dtype=np.float32)
                 dl_mask_padded = np.zeros((mh, mw), dtype=np.uint8)
                 unc = 0.95
                 terrain = 0
 
-            dl_mask = dl_mask_padded[pad_top:pad_top + nh, pad_left:pad_left + nw]
+            # Crop letterbox padding and apply continuous temporal probability EMA
+            prob_crop = prob_road_padded[pad_top:pad_top + nh, pad_left:pad_left + nw]
+            if self.prev_prob_crop is None or self.prev_prob_crop.shape != prob_crop.shape:
+                self.prev_prob_crop = prob_crop.copy()
+            else:
+                prob_crop = 0.40 * prob_crop + 0.60 * self.prev_prob_crop
+                self.prev_prob_crop = prob_crop.copy()
+
+            # Soft spatial Gaussian filtering and vertical morphological closing
+            prob_crop = prob_crop.astype(np.float32)
+            prob_smooth = cv2.GaussianBlur(prob_crop, (5, 5), 1.0)
+            k_vert = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 21))
+            dl_mask = (prob_smooth >= 0.45).astype(np.uint8)
+            dl_mask = cv2.morphologyEx(dl_mask, cv2.MORPH_CLOSE, k_vert)
 
             # 3. CLASSICAL & FUSION
             t_stage0 = time.perf_counter()
@@ -380,6 +404,7 @@ class LivePipeline:
             self.stage_samples["classical"].append(t_cf_ms)
 
             self.last_raw_mask = mask.copy()
+            self.last_prob_smooth = prob_smooth.copy()
             self.last_fused_alpha = fused_alpha
             self.last_active = active_str
             self.last_unc = unc
@@ -389,8 +414,8 @@ class LivePipeline:
 
         # 4. POST-PROCESS AT MODEL RESOLUTION
         t_stage0 = time.perf_counter()
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        k_vert = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 21))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_vert)
 
         if self.hood_poly_model is not None:
             hp_model_adj = self.hood_poly_model.copy()
@@ -398,30 +423,29 @@ class LivePipeline:
             hp_model_adj[:, 1] -= pad_top
             cv2.fillPoly(mask, [hp_model_adj], 0)
 
-        # Mask reflective strip at bottom center of hood (x in [0.38, 0.65], y >= 0.91)
-        r_y1 = int(round(0.91 * nh))
-        r_x1 = int(round(0.38 * nw))
-        r_x2 = int(round(0.65 * nw))
-        mask[r_y1:, r_x1:r_x2] = 0
+        # Mask reflective strip at bottom center of hood ONLY if hood is present
+        if self.hood_poly_model is not None:
+            r_y1 = int(round(0.91 * nh))
+            r_x1 = int(round(0.38 * nw))
+            r_x2 = int(round(0.65 * nw))
+            mask[r_y1:, r_x1:r_x2] = 0
 
+        # Smart component retention: keep all significant road components in the forward corridor
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
         if num_labels > 1:
-            target_pt = np.array([nw / 2.0, nh])
-            best_label = 1
-            min_dist = float("inf")
+            kept_mask = np.zeros_like(mask)
             for i in range(1, num_labels):
-                if stats[i, cv2.CC_STAT_AREA] < 50:
+                area = stats[i, cv2.CC_STAT_AREA]
+                if area < 80:
                     continue
-                dist = np.linalg.norm(centroids[i] - target_pt)
-                if dist < min_dist:
-                    min_dist = dist
-                    best_label = i
-            mask = (labels == best_label).astype(np.uint8) if min_dist < float("inf") else np.zeros_like(mask)
-
-        self.mask_history.append(mask)
-        if len(self.mask_history) > 2:
-            sum_mask = np.sum(self.mask_history, axis=0)
-            mask = (sum_mask > len(self.mask_history) // 2).astype(np.uint8)
+                cx, cy = centroids[i][0], centroids[i][1]
+                # Retain if significant area (>800 px) or inside the forward driving corridor
+                if area > 800 or (cy > 0.35 * nh and 0.15 * nw < cx < 0.85 * nw):
+                    kept_mask[labels == i] = 1
+            if np.count_nonzero(kept_mask) < 200:
+                largest_i = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+                kept_mask = (labels == largest_i).astype(np.uint8)
+            mask = kept_mask
 
         t_post_ms = (time.perf_counter() - t_stage0) * 1000.0
         self.timings["postprocess"] += t_post_ms / 1000.0
@@ -459,9 +483,11 @@ class LivePipeline:
             hold_count=self.steer_hold_counter,
             prev_speed=self.prev_speed,
             ipm_valid=ipm_res.valid,
+            prev_waypoints=self.prev_waypoints,
         )
         self.prev_steer_angle = cmd.angle
         self.prev_speed = cmd.speed
+        self.prev_waypoints = getattr(cmd, "path_waypoints", None)
         if cmd.saturating_term == "hold_angle":
             self.steer_hold_counter += 1
         else:
@@ -517,6 +543,9 @@ class LivePipeline:
         # Upscale mask to output resolution ONCE only for final drawing
         mask_full = cv2.resize(mask, (fw, fh), interpolation=cv2.INTER_NEAREST)
 
+        # Masked probability map for high-res smooth vector rendering
+        clean_prob = prob_smooth * mask.astype(np.float32)
+
         return FrameResult(
             mask=mask_full,
             command=cmd,
@@ -529,6 +558,7 @@ class LivePipeline:
             ipm=ipm_res,
             mode=self.current_mode,
             mask_model=mask,
+            prob_model=clean_prob,
         )
 
 
@@ -573,8 +603,52 @@ def annotate(
     c_animal = get_color("animal", [128, 0, 128])
     c_tiny = get_color("tiny", [128, 128, 128])
 
-    # 1. Fast mask overlay: blend only on the mask's bounding box
-    if getattr(res, "mask_model", None) is not None:
+    # 1. High-resolution antialiased butter-smooth mask overlay and vector contour
+    if getattr(res, "prob_model", None) is not None and np.any(res.prob_model > 0.05):
+        p_slice = res.prob_model
+        mh, mw = p_slice.shape[:2]
+
+        # Fast model-scale Continuous Temporal EMA
+        if "disp_prob" not in state or state["disp_prob"].shape != (mh, mw):
+            state["disp_prob"] = p_slice.copy()
+        else:
+            state["disp_prob"] = 0.25 * p_slice + 0.75 * state["disp_prob"]
+
+        smooth_field = cv2.GaussianBlur(state["disp_prob"], (5, 5), 1.2)
+        # Dual-threshold hysteresis at model scale: confident seeds (>= 0.45) & candidate road (>= 0.30)
+        seed_mask = smooth_field >= 0.45
+        cand_mask = (smooth_field >= 0.30).astype(np.uint8)
+        k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 11))
+        cand_mask = cv2.morphologyEx(cand_mask, cv2.MORPH_CLOSE, k_close)
+
+        # Eliminate disconnected spurious floating blobs on buildings/trees at model scale
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(cand_mask, connectivity=8)
+        clean_mask = np.zeros_like(cand_mask)
+        min_road_area = int(0.004 * mw * mh)
+        ego_bottom_y = int(0.60 * mh)
+        for lbl in range(1, num_labels):
+            if stats[lbl, cv2.CC_STAT_AREA] < min_road_area:
+                continue
+            lbl_m = labels == lbl
+            bottom_reach = stats[lbl, cv2.CC_STAT_TOP] + stats[lbl, cv2.CC_STAT_HEIGHT]
+            if bottom_reach >= ego_bottom_y or np.any(seed_mask[lbl_m]):
+                clean_mask[lbl_m] = 1
+
+        # Upscale clean binary mask to full frame resolution
+        high_mask = cv2.resize(clean_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+
+        if np.any(high_mask):
+            overlay = out.copy()
+            overlay[high_mask > 0] = c_drivable
+            cv2.addWeighted(overlay, 0.35, out, 0.65, 0, out)
+
+            cnts, _ = cv2.findContours(high_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_KCOS)
+            for c in cnts:
+                if cv2.contourArea(c) > 1000:
+                    eps = 0.0015 * cv2.arcLength(c, True)
+                    smooth_c = cv2.approxPolyDP(c, eps, True)
+                    cv2.drawContours(out, [smooth_c], -1, (255, 255, 255), thickness, cv2.LINE_AA)
+    elif getattr(res, "mask_model", None) is not None:
         mh, mw = res.mask_model.shape[:2]
         nz_y, nz_x = np.nonzero(res.mask_model)
         if len(nz_y) > 0:
@@ -587,7 +661,7 @@ def annotate(
             if y2 > y1 and x2 > x1:
                 roi = out[y1:y2, x1:x2]
                 model_slice = res.mask_model[my1:my2, mx1:mx2]
-                roi_m = cv2.resize(model_slice, (x2 - x1, y2 - y1), interpolation=cv2.INTER_NEAREST) > 0
+                roi_m = cv2.resize(model_slice, (x2 - x1, y2 - y1), interpolation=cv2.INTER_LINEAR) > 0.5
                 if np.any(roi_m):
                     overlay_roi = roi.copy()
                     overlay_roi[roi_m] = c_drivable
@@ -656,71 +730,109 @@ def annotate(
     scale_px = float(w) / float(p_w)
     scale_py = float(h) / float(p_h)
 
+    path_wp = getattr(res.command, "path_waypoints", None)
+    path_y = getattr(res.command, "path_y_evals", None)
     path_poly = getattr(res.command, "path_poly", None)
     path_y_range = getattr(res.command, "path_y_range", None)
-    if path_poly is not None and path_y_range is not None and (path_y_range[1] - path_y_range[0]) > 10:
+
+    if path_wp is not None and path_y is not None and len(path_wp) >= 4:
+        raw_pts = np.column_stack([path_wp * scale_px, path_y * scale_py]).astype(np.float32)
+        x0, y0 = float(w / 2.0), float(h - 2)
+        x1, y1 = float(raw_pts[-1, 0]), float(raw_pts[-1, 1])
+        steer_deg = float(getattr(res.command, "angle", 0.0))
+        steer_rad = np.radians(steer_deg)
+
+        # Hermite spline from ego bumper (x0, y0) to lookahead horizon (x1, y1)
+        num_pts = 25
+        t = np.linspace(0.0, 1.0, num_pts, dtype=np.float32)
+        y_dense = y0 + (y1 - y0) * t
+        s_t = 3.0 * (t ** 2) - 2.0 * (t ** 3)
+
+        # Road heading velocity at lookahead horizon (aligns path derivative with steering/road heading)
+        v1 = -(y1 - y0) * float(np.tan(steer_rad))
+        v1 = np.clip(v1, -0.8 * w, 0.8 * w)
+        x_dense = (1.0 - s_t) * x0 + s_t * x1 + (t ** 3 - t ** 2) * v1
+        dense_pts = np.column_stack([x_dense, y_dense]).astype(np.float32)
+
+        alpha_smooth = float(np.clip(0.18 + 0.22 * (min(abs(steer_deg), 15.0) / 15.0), 0.18, 0.40))
+        if "disp_pts" not in state or state["disp_pts"].shape != dense_pts.shape:
+            state["disp_pts"] = dense_pts
+        else:
+            state["disp_pts"] = alpha_smooth * dense_pts + (1.0 - alpha_smooth) * state["disp_pts"]
+        state["path_hold_count"] = 0
+    elif state.get("disp_pts") is not None and state.get("path_hold_count", 0) < 5:
+        state["path_hold_count"] = state.get("path_hold_count", 0) + 1
+    elif path_poly is not None and path_y_range is not None and (path_y_range[1] - path_y_range[0]) > 10:
         y_top, y_bot = path_y_range
         a_p, b_p, c_p = path_poly
-        y_vals = np.linspace(y_bot, y_top, num=15, dtype=np.float32)
-        x_vals = a_p * (y_vals ** 2) + b_p * y_vals + c_p
-        pts = np.column_stack([x_vals * scale_px, y_vals * scale_py]).astype(np.float32)
+        x0, y0 = float(w / 2.0), float(h - 2)
+        y1 = float(y_top * scale_py)
+        x1 = float((a_p * (y_top ** 2) + b_p * y_top + c_p) * scale_px)
+        steer_deg = float(getattr(res.command, "angle", 0.0))
+        steer_rad = np.radians(steer_deg)
 
-        ema_x = float(cfg.get("inference", {}).get("overlay", {}).get("ema_x", 0.35))
-        if "ema_pts" not in state or state["ema_pts"].shape != pts.shape:
-            state["ema_pts"] = pts
+        num_pts = 25
+        t = np.linspace(0.0, 1.0, num_pts, dtype=np.float32)
+        y_dense = y0 + (y1 - y0) * t
+        s_t = 3.0 * (t ** 2) - 2.0 * (t ** 3)
+        v1 = -(y1 - y0) * float(np.tan(steer_rad))
+        v1 = np.clip(v1, -0.8 * w, 0.8 * w)
+        x_dense = (1.0 - s_t) * x0 + s_t * x1 + (t ** 3 - t ** 2) * v1
+        dense_pts = np.column_stack([x_dense, y_dense]).astype(np.float32)
+
+        alpha_smooth = float(np.clip(0.18 + 0.22 * (min(abs(steer_deg), 15.0) / 15.0), 0.18, 0.40))
+        if "disp_pts" not in state or state["disp_pts"].shape != dense_pts.shape:
+            state["disp_pts"] = dense_pts
         else:
-            state["ema_pts"] = ema_x * pts + (1.0 - ema_x) * state["ema_pts"]
-
-        p = state["ema_pts"].astype(np.int32)
-        cv2.polylines(out, [p], False, (0, 0, 0), thickness + 2, cv2.LINE_AA)
-        cv2.polylines(out, [p], False, (0, 255, 255), thickness, cv2.LINE_AA)
-        cv2.arrowedLine(out, tuple(p[-2]), tuple(p[-1]), (0, 0, 0), thickness + 2, cv2.LINE_AA, tipLength=0.2)
-        cv2.arrowedLine(out, tuple(p[-2]), tuple(p[-1]), (0, 255, 255), thickness, cv2.LINE_AA, tipLength=0.2)
-    elif visible_road_h > 10 and p_mask[y_lookahead:y_road_bottom].any():
-        c_pts = []
-        step = max(1, visible_road_h // 10)
-        ego_c = p_w / 2.0
-        for y in range(y_road_bottom, y_lookahead - 1, -step):
-            row = p_mask[y]
-            nz = np.nonzero(row)[0]
-            if len(nz) < 2:
-                continue
-            diffs = np.diff(nz)
-            split_pts = np.where(diffs > 1)[0] + 1
-            runs = np.split(nz, split_pts)
-            best_run = None
-            min_dist = float("inf")
-            for r in runs:
-                if len(r) == 0:
-                    continue
-                r_start, r_end = float(r[0]), float(r[-1])
-                if r_start <= ego_c <= r_end:
-                    best_run = r
-                    break
-                d = min(abs(r_start - ego_c), abs(r_end - ego_c))
-                if d < min_dist:
-                    min_dist = d
-                    best_run = r
-            if best_run is not None and len(best_run) > 0:
-                run_c = (float(best_run[0]) + float(best_run[-1])) / 2.0
-                c_pts.append((run_c * scale_px, float(y) * scale_py))
-
-        if len(c_pts) >= 3:
-            pts = np.array(c_pts, dtype=np.float32)
-            ema_x = float(cfg.get("inference", {}).get("overlay", {}).get("ema_x", 0.35))
-            if "ema_pts" not in state or state["ema_pts"].shape != pts.shape:
-                state["ema_pts"] = pts
-            else:
-                state["ema_pts"] = ema_x * pts + (1.0 - ema_x) * state["ema_pts"]
-            p = state["ema_pts"].astype(np.int32)
-            cv2.polylines(out, [p], False, (0, 0, 0), thickness + 2, cv2.LINE_AA)
-            cv2.polylines(out, [p], False, (0, 255, 255), thickness, cv2.LINE_AA)
-            cv2.arrowedLine(out, tuple(p[-2]), tuple(p[-1]), (0, 0, 0), thickness + 2, cv2.LINE_AA, tipLength=0.2)
-            cv2.arrowedLine(out, tuple(p[-2]), tuple(p[-1]), (0, 255, 255), thickness, cv2.LINE_AA, tipLength=0.2)
-        else:
-            state.pop("ema_pts", None)
+            state["disp_pts"] = alpha_smooth * dense_pts + (1.0 - alpha_smooth) * state["disp_pts"]
+        state["path_hold_count"] = 0
     else:
-        state.pop("ema_pts", None)
+        state.pop("disp_pts", None)
+
+    if "disp_pts" in state and state["disp_pts"] is not None and len(state["disp_pts"]) >= 3:
+        pts = state["disp_pts"].astype(np.float32)
+
+        # 1. Compute exact forward tangent vector at the trajectory tip
+        vec = pts[-1] - pts[-2]
+        norm = float(np.hypot(vec[0], vec[1]))
+        if norm > 1e-3:
+            u = vec / norm
+        else:
+            steer_rad = np.radians(float(getattr(res.command, "angle", 0.0)))
+            u = np.array([np.sin(steer_rad), -np.cos(steer_rad)], dtype=np.float32)
+
+        n = np.array([-u[1], u[0]], dtype=np.float32)
+
+        scale = max(0.8, min(2.0, w / 848.0))
+        arrow_len = 16.0 * scale
+        arrow_width = 10.0 * scale
+        notch_depth = 5.0 * scale
+
+        # Arrowhead apex is EXACTLY the last point of the trajectory
+        p_tip = pts[-1]
+        p_right = p_tip - u * arrow_len + n * arrow_width
+        p_notch = p_tip - u * (arrow_len - notch_depth)
+        p_left = p_tip - u * arrow_len - n * arrow_width
+
+        # 2. Draw the trajectory line seamlessly up to p_notch
+        # Filter out any points closer to p_tip than p_notch to prevent back-tracking zigzags
+        d_notch = arrow_len - notch_depth
+        valid_mask = [float(np.dot(p_tip - pt, u)) > d_notch for pt in pts]
+        valid_pts = pts[valid_mask]
+        if len(valid_pts) > 0:
+            line_pts = np.vstack([valid_pts, p_notch.reshape(1, 2)])
+        else:
+            line_pts = np.vstack([pts[0:1], p_notch.reshape(1, 2)])
+        p_int = np.round(line_pts).astype(np.int32)
+
+        cv2.polylines(out, [p_int], False, (0, 0, 0), thickness + 3, cv2.LINE_AA)
+        cv2.polylines(out, [p_int], False, (0, 255, 255), thickness + 1, cv2.LINE_AA)
+
+        # 3. Draw the aerodynamic arrowhead
+        poly = np.round(np.array([p_tip, p_right, p_notch, p_left])).astype(np.int32)
+        cv2.drawContours(out, [poly], -1, (0, 0, 0), thickness + 3, cv2.LINE_AA)
+        cv2.fillPoly(out, [poly], (0, 255, 255), cv2.LINE_AA)
+        cv2.polylines(out, [poly], True, (0, 0, 0), thickness, cv2.LINE_AA)
 
     placed_rects: List[List[int]] = []
 

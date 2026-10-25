@@ -12,6 +12,12 @@ from pathlib import Path
 import sys
 from typing import Tuple
 
+if sys.platform == "win32":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
+
 import torch
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -53,26 +59,29 @@ def export_to_onnx(
     dummy_input = torch.randn(1, 3, h, w, dtype=torch.float32)
 
     wrapper = ONNXWrapper(model)
+    wrapper.eval()
     out_file = Path(output_path)
     out_file.parent.mkdir(parents=True, exist_ok=True)
 
     logger.info("Exporting model to ONNX at %s (input size: %dx%d)...", out_file, h, w)
     try:
-        torch.onnx.export(
-            wrapper,
-            dummy_input,
-            str(out_file),
-            export_params=True,
-            opset_version=opset,
-            do_constant_folding=True,
-            input_names=["image"],
-            output_names=["seg_logits", "alpha"],
-            dynamic_axes={
+        # Use classic TorchScript-based exporter (dynamo=False) for maximum compatibility with dynamic_axes and Windows encoding
+        export_kwargs = {
+            "export_params": True,
+            "opset_version": opset,
+            "do_constant_folding": True,
+            "input_names": ["image"],
+            "output_names": ["seg_logits", "alpha"],
+            "dynamic_axes": {
                 "image": {0: "batch_size"},
                 "seg_logits": {0: "batch_size"},
                 "alpha": {0: "batch_size"},
             },
-        )
+        }
+        try:
+            torch.onnx.export(wrapper, dummy_input, str(out_file), dynamo=False, **export_kwargs)
+        except TypeError:
+            torch.onnx.export(wrapper, dummy_input, str(out_file), **export_kwargs)
         logger.info("Successfully exported ONNX model (%d bytes)", out_file.stat().st_size)
 
         if int8:

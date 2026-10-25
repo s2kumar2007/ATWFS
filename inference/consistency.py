@@ -67,7 +67,7 @@ def geometric_score(mask: np.ndarray, cfg: Dict[str, Any], apex_y: Optional[int]
         apex_y = int(h * 0.95)
     
     y1, y2 = max(0, apex_y - 15), max(0, apex_y - 5)
-    x1, x2 = int(w/2 - 10), int(w/2 + 10)
+    x1, x2 = int(w / 2 - 10), int(w / 2 + 10)
     ego_penalty = 1.0
     if y2 > y1 and y2 < h:
         patch = m[y1:y2, x1:x2]

@@ -108,6 +108,18 @@ def main() -> None:
         total,
     )
 
+    # Pre-index archive files for fast lookup (supports both flat and nested archive layouts)
+    logger.info("Indexing source image and mask archives...")
+    img_lookup: dict[str, Path] = {}
+    for p in img_arch.rglob("*.png"):
+        img_lookup[p.name] = p
+        img_lookup[p.name.split("_")[0]] = p
+
+    mask_lookup: dict[str, Path] = {}
+    for p in mask_arch.rglob("*.png"):
+        mask_lookup[p.name] = p
+        mask_lookup[p.name.split("_")[0]] = p
+
     # Build a mapping Image_N.png -> (split, drive_folder, stem)
     # We assign each Image_N to drive d<block_index:04d> where block_index
     # is the position of the image within its split (groups of 20 consecutive
@@ -128,13 +140,25 @@ def main() -> None:
                     logger.warning("Unexpected filename format: %s – skipping.", fname)
                     continue
                 stem = f"{img_id:06d}"
-                src_img = img_arch / fname
-                src_mask = mask_arch / f"Mask_{img_id}.png"
-                if not src_img.exists():
-                    logger.warning("Missing image: %s – skipping.", src_img)
+                src_img = (
+                    (img_arch / fname) if (img_arch / fname).exists()
+                    else img_lookup.get(fname) or img_lookup.get(stem) or img_lookup.get(f"{stem}_leftImg8bit.png")
+                )
+                mask_candidate_names = [f"Mask_{img_id}.png", fname, stem, f"{stem}_gtFine_labellevel3Ids.png"]
+                src_mask = None
+                for m_name in mask_candidate_names:
+                    if (mask_arch / m_name).exists():
+                        src_mask = mask_arch / m_name
+                        break
+                    if m_name in mask_lookup:
+                        src_mask = mask_lookup[m_name]
+                        break
+
+                if src_img is None or not src_img.exists():
+                    logger.warning("Missing image: %s – skipping.", fname)
                     continue
-                if not src_mask.exists():
-                    logger.warning("Missing mask: %s – skipping.", src_mask)
+                if src_mask is None or not src_mask.exists():
+                    logger.warning("Missing mask for image: %s – skipping.", fname)
                     continue
 
                 dst_img_dir = dst / "leftImg8bit" / split / drive
@@ -149,10 +173,14 @@ def main() -> None:
                     pass  # already done
                 else:
                     shutil.copy2(src_img, dst_img)
-                    # Collapse mask
                     m = np.array(Image.open(src_mask))
-                    out = np.where(m == a.drivable_value, 0, 3).astype(np.uint8)
-                    Image.fromarray(out).save(dst_mask_path)
+                    unique_vals = set(np.unique(m))
+                    if unique_vals.issubset({0, 3, 255}) and 0 in unique_vals:
+                        # Already collapsed: 0=road/drivable, 3=non-drivable
+                        Image.fromarray(m.astype(np.uint8)).save(dst_mask_path)
+                    else:
+                        out = np.where(m == a.drivable_value, 0, 3).astype(np.uint8)
+                        Image.fromarray(out).save(dst_mask_path)
 
                 name_mapping[fname] = f"{drive}/{stem}_leftImg8bit.png"
                 processed += 1

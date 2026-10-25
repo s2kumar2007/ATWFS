@@ -98,14 +98,13 @@ def calibrate_hood_from_frames(
     if len(nz_y) < 50:
         return None
 
-    # Check that hood is actually at the bottom (top of hood should not exceed top half of frame)
+    # A genuine vehicle hood is strictly confined to the bottom edge (e.g. y >= 0.88).
+    # If the static low-variance region extends above y=0.85, the vehicle was stopped/slow
+    # over uniform asphalt; return None to avoid cutting out the drivable road.
     min_y = np.min(nz_y)
-    if min_y < 0.35 * h:
-        # If static region goes higher than y=0.35, it's not a car hood
-        hood_mask[:int(0.35 * h), :] = 0
-        nz_y, nz_x = np.nonzero(hood_mask)
-        if len(nz_y) < 50:
-            return None
+    if min_y < 0.85 * h:
+        logger.info("Low-variance region extends up to y=%.3f; stationary road, no static hood.", min_y / h)
+        return None
 
     pts_2d = np.column_stack([nz_x, nz_y])
     hull = cv2.convexHull(pts_2d)
@@ -144,7 +143,8 @@ def calibrate_or_load_hood_polygon(
         try:
             data = json.loads(profile_file.read_text(encoding="utf-8"))
             poly = data.get("hood_polygon")
-            if poly is not None:
+            if "hood_polygon" in data:
+                poly = data.get("hood_polygon")
                 logger.info("Loaded cached camera hood profile from %s", profile_file)
                 return poly
         except Exception as exc:

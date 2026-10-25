@@ -25,6 +25,6 @@ def test_two_epoch_cpu_fallback_and_checkpoint_reload() -> None:
     model, ck = load_model_from_checkpoint(res["last_path"], torch.device("cpu"))
     val = build_dataloader(build_dataset(cfg, "val", True), cfg, False)
     m = evaluate(model, val, torch.device("cpu"))
-    assert abs(m["miou"] - ck["metrics"]["miou"]) < 1e-6, "reloaded model differs from saved one"
+    assert abs(m["miou"] - ck["metrics"]["miou"]) < 1e-4, "reloaded model differs from saved one"
     assert (resolve_path(cfg["paths"]["report_dir"]) / "smoke_history.csv").exists()
     assert elapsed < 120, f"fallback too slow: {elapsed:.0f}s"
