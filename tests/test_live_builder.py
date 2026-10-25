@@ -22,9 +22,16 @@ def test_builder_matches_video_frame(tmp_path, monkeypatch):
     # Read the same encoded image through both paths, avoiding codec differences.
     image = np.full((96, 160, 3), 125, dtype=np.uint8)
     image[48:] = 85
-    source = tmp_path / 'image.png'
-    assert cv2.imwrite(str(source), image)
-    expected = direct.process_frame(cv2.imread(str(source)), 0)
+    source = tmp_path / 'source.avi'
+    writer = cv2.VideoWriter(str(source), cv2.VideoWriter_fourcc(*'MJPG'), 25.0, (160, 96))
+    assert writer.isOpened()
+    writer.write(image)
+    writer.release()
+    cap = cv2.VideoCapture(str(source))
+    ok, decoded = cap.read()
+    cap.release()
+    assert ok
+    expected = direct.process_frame(decoded.copy(), 0)
     captured = []
     original = LivePipeline.process_frame
     def capture(self, *args, **kwargs):

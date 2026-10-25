@@ -1431,6 +1431,7 @@ def run_video(
     )
     inf = cfg["inference"]
     device = pipeline.device
+    seg_str = "ONNX Runtime" if pipeline.onnx_session is not None else str(device)
     profile = profile or ("quality" if torch.cuda.is_available() else "cpu")
     if fast:
         profile = "fast"
