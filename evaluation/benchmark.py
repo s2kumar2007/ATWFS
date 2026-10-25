@@ -13,6 +13,7 @@ import argparse
 import csv
 import itertools
 import logging
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -94,8 +95,13 @@ def run_benchmark(cfg: Dict[str, Any], synthetic: bool = False, teacher_ckpt: Op
     for name, method, model, dev in variants:
         m = evaluate(model.to(dev) if "int8" not in name else model, val_loader, dev)
         row = {"variant": name, "method": method, "params_M": round(count_params(model) / 1e6, 3) if "int8" not in name else float("nan"),
-               "size_MB": round(model_size_mb(model), 3), "cpu_fps": round(cpu_fps(model, (1, 3, h, w), c["fps_warmup"], c["fps_iters"]), 2),
-               **{k: round(m[k], 4) for k in ("miou", "iou_drivable", "pixel_acc", "terrain_acc", "ece")}}
+               "size_MB": round(model_size_mb(model), 3), "cpu_fps": round(cpu_fps(model, (1, 3, h, w), c["fps_warmup"], c["fps_iters"]), 2)}
+        for k in ("miou", "iou_drivable", "pixel_acc", "terrain_acc", "ece"):
+            val = m[k]
+            if k == "terrain_acc" and isinstance(val, float) and math.isnan(val):
+                row[k] = "not trained (out of scope)"
+            else:
+                row[k] = round(val, 4)
         rows.append(row)
         logger.info("benchmarked %s", name)
     out = Path(out_csv) if out_csv else resolve_path(cfg["paths"]["report_dir"]) / "compression_benchmark.csv"

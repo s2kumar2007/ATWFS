@@ -1,0 +1,40 @@
+=================================================================
+ATWFS INFERENCE RUN SUMMARY (2219 FRAMES PROCESSED)
+=================================================================
+Backend:            onnx
+Device:             ONNX Runtime (student_v2.onnx)
+Profile:            quality
+Segmentation Rate:  Every 1 frame(s)
+Detector Cadence:   Every 3 frames (yolov8s.pt @ imgsz 640)
+-----------------------------------------------------------------
+Average FPS:        13.15 (Baseline: 11.18)
+P95 FPS:            10.67 (Baseline: 7.52)
+Trust (min/mean/max): 0.150 / 0.706 / 0.912 (Baseline: 0.049 / 0.684 / 0.928)
+FALLBACK frames:    20.1% (Baseline: 22.3%)
+Estimator Switches: 16
+Obstacle Flag:      26.7% (Baseline: 40.0%)
+Detections / Frame: 1.76 (Baseline: 1.52)
+Frames 0 Detections: 23.6% (523/2219)
+Steering == 0.0 deg: 0.0% (0/2219)
+Steering (|angle| >= 15 deg): 0.0% (Baseline: 12.0%)
+Steering (|angle| >= 20 deg): 0.0% (Baseline: 8.0%)
+Steering Saturation (|angle| >= 29.5 deg): 0.0% (Baseline: 0.0%)
+Speed == 0.0 m/s:   6.0% (133/2219)
+Frames Model >150ms:0
+Path/Steer Sign Agreement: 81.5%
+Mode Switches:      0 (Current: day)
+-----------------------------------------------------------------
+PER-STAGE TIMINGS TABLE (ms):
+Stage                | Mean (ms)  | P95 (ms)   | Total (s) 
+-----------------------------------------------------------------
+read                 | 0.92       | 1.89       | 2.05      
+preprocess           | 1.33       | 2.89       | 2.95      
+model                | 54.85      | 69.71      | 121.70    
+classical            | 5.91       | 19.27      | 13.12     
+YOLO (per-frame)     | 1.51       | 2.47       | 3.35      
+IPM                  | 2.61       | 12.87      | 5.80      
+postprocess          | 1.50       | 2.02       | 3.34      
+annotate             | 11.81      | 15.86      | 26.20     
+write                | 5.25       | 6.80       | 11.65     
+YOLO (active pass)   | 65.72      | 101.65     | 48.50     
+=================================================================

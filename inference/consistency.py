@@ -19,7 +19,7 @@ def _clip01(x: float) -> float:
     return float(np.clip(x, 0.0, 1.0)) if np.isfinite(x) else 0.0
 
 
-def geometric_score(mask: np.ndarray, cfg: Dict[str, Any]) -> float:
+def geometric_score(mask: np.ndarray, cfg: Dict[str, Any], apex_y: Optional[int] = None) -> float:
     """Contour-based road-shape plausibility.
 
     Sub-scores (weights from ``consistency.geometric.weights``):
@@ -63,7 +63,19 @@ def geometric_score(mask: np.ndarray, cfg: Dict[str, Any]) -> float:
     s_bottom = float(band.mean()) / 0.15
     wts = cfg["weights"]
     parts = {"area": s_area, "solidity": s_solid, "perspective": s_persp, "connectivity": s_conn, "bottom_touch": s_bottom}
+    if apex_y is None:
+        apex_y = int(h * 0.95)
+    
+    y1, y2 = max(0, apex_y - 15), max(0, apex_y - 5)
+    x1, x2 = int(w / 2 - 10), int(w / 2 + 10)
+    ego_penalty = 1.0
+    if y2 > y1 and y2 < h:
+        patch = m[y1:y2, x1:x2]
+        if patch.size > 0 and patch.mean() < 0.5:
+            ego_penalty = 0.3
+            
     score = sum(wts[k] * _clip01(v) for k, v in parts.items()) / sum(wts[k] for k in parts)
+    score *= ego_penalty
     return _clip01(score)
 
 

@@ -1,8 +1,6 @@
-# Pinned to the versions this project was built and smoke-tested with (Python 3.12, Linux, CPU).
-# Windows CPU: `pip install -r requirements.txt` gives the CPU build of torch by default.
-# Colab/Kaggle: torch/torchvision are preinstalled with CUDA; skip those two lines there if you prefer.
-torch==2.14.1
-torchvision==0.29.1
+# Note: Pinned versions should match the environment. For CUDA 12.1 (e.g. torch 2.5.1+cu121), see requirements-cuda.txt
+torch>=2.0.0
+torchvision>=0.15.0
 # numpy/scipy: newer pins need Python>=3.11; Python 3.10 gets the last compatible releases (3.10 pins not tested here)
 numpy==2.4.4; python_version >= "3.11"
 numpy==2.2.6; python_version < "3.11"

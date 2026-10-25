@@ -36,14 +36,31 @@ def test_all_terrain_labels_ignored_is_finite_and_has_grads() -> None:
     # Try forcing log_vars to large negative values to check bounding
     crit.log_vars.data.fill_(-10.0)
     
-    total, _ = crit(model(batch["image"]), batch)
+    total, info = crit(model(batch["image"]), batch)
     total.backward()
     
     assert torch.isfinite(total)
-    # The loss must be bounded below because log_vars are clamped to -4
-    # and terrain is skipped
-    assert total.item() >= -8.0  # -4 * 2 tasks
+    assert total.item() > 0.0, f"Expected total loss > 0, got {total.item()}"
+    assert info["terrain"] == 0.0, "Ignored terrain loss must be 0.0"
     assert all(p.grad is not None for p in model.parameters())
+
+
+def test_total_loss_is_always_strictly_positive() -> None:
+    """Ensure total loss is strictly positive under extreme log_vars and varied batches."""
+    cfg = smoke_config()
+    model, crit = build_model(cfg["model"]), MultiTaskLoss(cfg["loss"])
+    batch = _batch(cfg)
+    
+    for val in [-100.0, -2.0, 0.0, 2.0, 100.0]:
+        crit.log_vars.data.fill_(val)
+        out = model(batch["image"])
+        total, info = crit(out, batch)
+        assert total.item() > 0.0, f"Total loss must be positive with log_vars={val}, got {total.item()}"
+        assert info["loss"] > 0.0
+        assert info["seg"] >= 0.0
+        assert info["evidence"] >= 0.0
+        assert info["term_seg"] >= 0.0
+        assert info["term_evid"] >= 0.0
 
 
 def test_components() -> None:
@@ -53,4 +70,5 @@ def test_components() -> None:
     lg, y = torch.randn(2, 2, 8, 8), torch.randint(0, 2, (2, 8, 8))
     assert 0 <= float(dice_loss(lg, y)) <= 1
     tot, fit = evidential_loss(torch.rand(2, 2, 8, 8) * 5 + 1, y, 0.5)
-    assert torch.isfinite(tot) and torch.isfinite(fit)
+    assert torch.isfinite(tot) and torch.isfinite(fit) and tot.item() >= 0.0
+

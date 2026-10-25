@@ -94,7 +94,8 @@ def load_teacher(cfg: Dict[str, Any], device: torch.device, ckpt: Optional[str] 
 
 
 def train_distill(cfg: Dict[str, Any], synthetic: bool = False, teacher_ckpt: Optional[str] = None,
-                  epochs: Optional[int] = None, tag: str = "student") -> Dict[str, Any]:
+                  epochs: Optional[int] = None, tag: str = "student",
+                  resume_path: Optional[str] = None) -> Dict[str, Any]:
     """Distil the teacher into the student.
 
     Args:
@@ -103,6 +104,7 @@ def train_distill(cfg: Dict[str, Any], synthetic: bool = False, teacher_ckpt: Op
         teacher_ckpt: Teacher checkpoint path.
         epochs: Epoch override (default ``distill.epochs``).
         tag: Checkpoint prefix.
+        resume_path: Path to checkpoint to resume from.
 
     Returns:
         Result dict from :func:`run_training`.
@@ -116,7 +118,8 @@ def train_distill(cfg: Dict[str, Any], synthetic: bool = False, teacher_ckpt: Op
     tr = build_dataloader(build_dataset(cfg, "train", synthetic), cfg, True)
     va = build_dataloader(build_dataset(cfg, "val", synthetic), cfg, False)
     return run_training(cfg, student, MultiTaskLoss(cfg["loss"]), tr, va, device, tag, cfg["student"],
-                        epochs or cfg["distill"]["epochs"], make_distill_loss(teacher.to(device), cfg["distill"]))
+                        epochs or cfg["distill"]["epochs"], make_distill_loss(teacher.to(device), cfg["distill"]),
+                        resume_path=resume_path)
 
 
 def main() -> None:
@@ -126,10 +129,26 @@ def main() -> None:
     ap.add_argument("--synthetic", action="store_true")
     ap.add_argument("--teacher", default=None)
     ap.add_argument("--epochs", type=int, default=None)
+    ap.add_argument("--tag", default="student", help="Checkpoint name prefix (e.g. student_v2)")
+    ap.add_argument("--resume", type=str, default=None, help="Resume student from checkpoint")
+    ap.add_argument("--num-workers", type=int, default=None,
+                    help="DataLoader num_workers override (Windows: 4)")
+    ap.add_argument("--batch-size-override", type=int, default=None,
+                    help="Override batch size (OOM recovery)")
     a = ap.parse_args()
     setup_logging()
-    res = train_distill(load_config(a.config), a.synthetic, a.teacher, a.epochs)
-    logger.info("Done. Student checkpoint: %s", res["best_path"])
+    cfg = load_config(a.config)
+    if a.num_workers is not None:
+        cfg["data"]["num_workers"] = a.num_workers
+    if a.batch_size_override is not None:
+        cfg["train"]["batch_size"] = a.batch_size_override
+    try:
+        res = train_distill(cfg, a.synthetic, a.teacher, a.epochs, a.tag, a.resume)
+        logger.info("Done. Student checkpoint: %s", res["best_path"])
+    except torch.cuda.OutOfMemoryError as oom:
+        logger.error("CUDA Out of Memory during distillation: %s", oom)
+        import sys
+        sys.exit(2)
 
 
 if __name__ == "__main__":

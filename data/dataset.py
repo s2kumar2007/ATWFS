@@ -1,6 +1,7 @@
 """Datasets: real IDD (official splits) and synthetic, sharing one processing pipeline."""
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Tuple
@@ -8,7 +9,7 @@ from typing import Any, Dict, List, Optional, Protocol, Tuple
 import cv2
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from data.augment import StandardAugment, SyntheticConditionAugment
 from data.labels import collapse_to_binary, ids_to_mask
@@ -16,6 +17,28 @@ from data.synthetic import SyntheticSource
 from utils.config import resolve_path
 
 logger = logging.getLogger(__name__)
+
+
+def letterbox_pair(img: np.ndarray, raw: np.ndarray, target_size: Tuple[int, int],
+                   ignore_label: int = 255) -> Tuple[np.ndarray, np.ndarray]:
+    """Resize image and raw mask with aspect ratio preserved, centering with padding."""
+    mh, mw = target_size
+    fh, fw = img.shape[:2]
+    if (fh, fw) == (mh, mw):
+        return img, raw
+    scale = min(mw / fw, mh / fh)
+    nw, nh = int(round(fw * scale)), int(round(fh * scale))
+    small_img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+    small_raw = cv2.resize(raw, (nw, nh), interpolation=cv2.INTER_NEAREST)
+    if (nw, nh) == (mh, mw):
+        return small_img, small_raw
+    pad_top = (mh - nh) // 2
+    pad_left = (mw - nw) // 2
+    padded_img = np.zeros((mh, mw, 3), dtype=np.uint8)
+    padded_raw = np.full((mh, mw), ignore_label, dtype=np.uint8)
+    padded_img[pad_top:pad_top + nh, pad_left:pad_left + nw] = small_img
+    padded_raw[pad_top:pad_top + nh, pad_left:pad_left + nw] = small_raw
+    return padded_img, padded_raw
 
 
 class SampleSource(Protocol):
@@ -131,6 +154,7 @@ class DrivableDataset(Dataset):
         self.std = np.asarray(d["imagenet_std"], np.float32)
         self.std_aug = StandardAugment(cfg["augmentation"]["standard"], seed)
         self.syn_aug = SyntheticConditionAugment(cfg["augmentation"]["synthetic"], seed + 1)
+        self.letterbox = bool(d.get("letterbox", True))
 
     def __len__(self) -> int:
         """Return the dataset length."""
@@ -157,8 +181,11 @@ class DrivableDataset(Dataset):
         img, raw, terrain = self.source.load(i)
         h, w = self.size
         if img.shape[:2] != (h, w):
-            img = cv2.resize(img, (w, h), interpolation=cv2.INTER_LINEAR)
-            raw = cv2.resize(raw, (w, h), interpolation=cv2.INTER_NEAREST)
+            if self.letterbox:
+                img, raw = letterbox_pair(img, raw, (h, w), self.ignore_label)
+            else:
+                img = cv2.resize(img, (w, h), interpolation=cv2.INTER_LINEAR)
+                raw = cv2.resize(raw, (w, h), interpolation=cv2.INTER_NEAREST)
         mask = collapse_to_binary(raw, self.drivable_ids)
         obst = ids_to_mask(raw, self.obstacle_ids)
         valid = (raw != self.ignore_label).astype(np.uint8)  # 0 where annotators left the pixel unlabeled
@@ -207,13 +234,90 @@ def _seed_worker(worker_id: int) -> None:
         info.dataset.reseed(int(torch.initial_seed() % 2**31) + worker_id)
 
 
+def _load_class_weights(ds: Dataset, weights_file: Path) -> Optional[list]:
+    """Load per-sample weights from train_weights.json using name_mapping.json.
+
+    train_weights.json keys are Image_N.png (original archive names).
+    name_mapping.json maps Image_N.png -> drive/stem_leftImg8bit.png.
+    IDDSource.files is a list of (image_path, mask_path) where image_path.name
+    is stem_leftImg8bit.png.  We invert the mapping to go stem_name -> weight.
+    """
+    if not weights_file.exists():
+        logger.warning("train_weights.json not found at %s; no class balancing.", weights_file)
+        return None
+    if not (hasattr(ds, "source") and hasattr(ds.source, "files")):
+        return None
+
+    mapping_file = weights_file.parent / "name_mapping.json"
+    with open(weights_file, "r", encoding="utf-8") as f:
+        w_dict: Dict[str, Any] = json.load(f)
+
+    # Build reverse: converted_img_name -> weight & fallback_share
+    img_name_to_weight: Dict[str, float] = {}
+    img_name_to_share: Dict[str, float] = {}
+    if mapping_file.exists():
+        with open(mapping_file, "r", encoding="utf-8") as f:
+            name_map: Dict[str, str] = json.load(f)  # Image_N.png -> "d0000/000000_leftImg8bit.png"
+        for orig, converted in name_map.items():
+            converted_stem = Path(converted).name  # "000000_leftImg8bit.png"
+            entry = w_dict.get(orig)
+            if entry is not None:
+                img_name_to_weight[converted_stem] = float(entry.get("weight", 1.0))
+                if "fallback_share" in entry:
+                    img_name_to_share[converted_stem] = float(entry["fallback_share"])
+    else:
+        # Fallback: try Image_N.png direct match (if names were not converted)
+        for orig, entry in w_dict.items():
+            img_name_to_weight[orig] = float(entry.get("weight", 1.0))
+            if "fallback_share" in entry:
+                img_name_to_share[orig] = float(entry["fallback_share"])
+
+    weights = [img_name_to_weight.get(ip.name, 1.0) for ip, _ in ds.source.files]
+    shares = [img_name_to_share.get(ip.name, 0.0) for ip, _ in ds.source.files]
+    w_arr = np.asarray(weights, dtype=np.float32)
+    s_arr = np.asarray(shares, dtype=np.float32)
+    n_trivial = int((w_arr == 1.0).sum())
+    unweighted_share = float(np.mean(s_arr)) if len(s_arr) > 0 else 0.0
+    weighted_share = float(np.average(s_arr, weights=w_arr)) if len(s_arr) > 0 and w_arr.sum() > 0 else 0.0
+
+    stats = {
+        "min": float(w_arr.min()),
+        "mean": float(w_arr.mean()),
+        "max": float(w_arr.max()),
+        "std": float(w_arr.std()),
+        "without_sampling": unweighted_share,
+        "with_sampling": weighted_share,
+    }
+    setattr(ds, "weight_stats", stats)
+
+    logger.info(
+        "Class-balanced sampler: n=%d  weight min=%.3f  mean=%.3f  max=%.3f  trivial(1.0)=%d (%.1f%%)",
+        len(weights), float(w_arr.min()), float(w_arr.mean()), float(w_arr.max()),
+        n_trivial, 100.0 * n_trivial / max(1, len(weights)),
+    )
+    logger.info(
+        "Drivable-fallback share in training split: without_sampling=%.2f%%, with_sampling(expected)=%.2f%%",
+        unweighted_share * 100.0, weighted_share * 100.0,
+    )
+    if n_trivial == len(weights):
+        logger.warning("ALL weights are 1.0 – name_mapping.json may not match the converted files. "
+                       "Check that scripts/build_dataset_from_splits.py has been run.")
+    return weights
+
+
 def build_dataloader(ds: Dataset, cfg: Dict[str, Any], shuffle: bool, batch_size: Optional[int] = None) -> DataLoader:
     """Create a reproducible DataLoader.
+
+    When ``data.class_balanced`` is True and the training split is being loaded
+    (``shuffle=True``), a WeightedRandomSampler is built from
+    ``data/splits/train_weights.json`` using ``data/splits/name_mapping.json``
+    to translate between the raw Image_N.png names (keys in train_weights.json)
+    and the converted file names (values in the converted IDD layout).
 
     Args:
         ds: Dataset.
         cfg: Full config.
-        shuffle: Shuffle flag.
+        shuffle: Shuffle flag (True only for training).
         batch_size: Optional override.
 
     Returns:
@@ -221,8 +325,24 @@ def build_dataloader(ds: Dataset, cfg: Dict[str, Any], shuffle: bool, batch_size
     """
     g = torch.Generator()
     g.manual_seed(cfg["seed"])
-    nw = int(cfg["data"]["num_workers"])
-    return DataLoader(ds, batch_size=batch_size or cfg["train"]["batch_size"], shuffle=shuffle,
-                      num_workers=nw, worker_init_fn=_seed_worker, generator=g,
-                      pin_memory=torch.cuda.is_available(), drop_last=False,
-                      persistent_workers=nw > 0)
+    nw = int(cfg["data"].get("num_workers", 0))
+    sampler = None
+    if shuffle and cfg.get("data", {}).get("class_balanced", False):
+        weights_file = resolve_path("data/splits/train_weights.json")
+        weights = _load_class_weights(ds, weights_file)
+        if weights is not None and len(weights) == len(ds):
+            sampler = WeightedRandomSampler(weights, num_samples=len(ds), replacement=True)
+            shuffle = False
+    return DataLoader(
+        ds,
+        batch_size=batch_size or cfg["train"]["batch_size"],
+        shuffle=shuffle,
+        sampler=sampler,
+        num_workers=nw,
+        worker_init_fn=_seed_worker,
+        generator=g,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=False,
+        persistent_workers=(nw > 0),
+    )
+

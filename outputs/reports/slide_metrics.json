@@ -1,0 +1,46 @@
+{
+    "hardware": {
+        "cpu_name": "Intel64 Family 6 Model 186 Stepping 2, GenuineIntel",
+        "cores": "10 physical / 16 logical",
+        "ram": "15.7 GB",
+        "torch_version": "2.5.1+cu121",
+        "torch_threads": 10,
+        "device": "cpu"
+    },
+    "results": {
+        "Teacher": {
+            "input_size": "288x512",
+            "ckpt_size_MB": 52.74063587188721,
+            "params_M": 4.586572,
+            "GMACs": 4.531194496,
+            "GFLOPs": 9.062388992,
+            "peak_mem_model_MB": 839.8828125,
+            "inference_ms_mean": 258.87118101119995,
+            "inference_ms_median": 223.2978343963623,
+            "inference_ms_p95": 488.7917637825012,
+            "fps": 3.8629251664623703,
+            "peak_mem_e2e_MB": 1069.81640625,
+            "e2e_ms_mean": 316.0579776763916,
+            "e2e_ms_median": 236.28604412078857,
+            "e2e_ms_p95": 613.8187527656555,
+            "e2e_fps": 3.163976455686524
+        },
+        "Student": {
+            "input_size": "288x512",
+            "ckpt_size_MB": 16.168431282043457,
+            "params_M": 1.39398,
+            "GMACs": 1.68461376,
+            "GFLOPs": 3.36922752,
+            "peak_mem_model_MB": 667.7265625,
+            "inference_ms_mean": 132.31433153152466,
+            "inference_ms_median": 129.27544116973877,
+            "inference_ms_p95": 195.68599462509155,
+            "fps": 7.557760285111248,
+            "peak_mem_e2e_MB": 893.4375,
+            "e2e_ms_mean": 158.03947925567627,
+            "e2e_ms_median": 149.05667304992676,
+            "e2e_ms_p95": 211.21516227722162,
+            "e2e_fps": 6.327532871594698
+        }
+    }
+}

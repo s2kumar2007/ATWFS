@@ -20,6 +20,7 @@ import argparse
 import csv
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -155,10 +156,16 @@ def run_evaluation(cfg: Dict[str, Any], checkpoint: Optional[str], synthetic: bo
     m = evaluate_binary_idd(model.to(device), loader, device, cfg["train"]["ece_bins"])
     out = Path(out_dir) if out_dir else resolve_path(cfg["paths"]["report_dir"])
     out.mkdir(parents=True, exist_ok=True)
-    (out / "evaluation.json").write_text(json.dumps(m, indent=2))
+    save_m = {}
+    for k, v in m.items():
+        if k == "terrain_acc" and (isinstance(v, str) or (isinstance(v, float) and math.isnan(v))):
+            save_m[k] = "not trained (out of scope)"
+        else:
+            save_m[k] = v
+    (out / "evaluation.json").write_text(json.dumps(save_m, indent=2))
     with open(out / "evaluation.csv", "w", newline="", encoding="utf-8") as fh:
-        w = csv.writer(fh); w.writerow(["metric", "value"]); w.writerows(m.items())
-    logger.info("Evaluation (%s): %s", split, {k: round(v, 4) for k, v in m.items()})
+        w = csv.writer(fh); w.writerow(["metric", "value"]); w.writerows(save_m.items())
+    logger.info("Evaluation (%s): %s", split, {k: (round(v, 4) if isinstance(v, (int, float)) else v) for k, v in save_m.items()})
     return m
 
 
