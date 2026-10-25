@@ -1160,56 +1160,43 @@ def _open_writer(path: Path, fps: float, size_wh: Tuple[int, int], fourcc: str) 
     return wr, alt
 
 
-def run_video(
+def build_live_pipeline(
     cfg: Dict[str, Any],
-    source: Union[int, str],
-    output_path: str,
-    model: Optional[torch.nn.Module] = None,
-    checkpoint: Optional[str] = None,
-    detector: Optional[ObstacleDetector] = None,
-    max_frames: Optional[int] = None,
-    display: Optional[bool] = None,
-    max_width: Optional[int] = 1280,
-    log_features: Optional[str] = None,
-    speed_mps: Optional[float] = None,
-    force: bool = False,
-    imu_csv: Optional[str] = None,
-    serial_port: Optional[str] = None,
-    serial_baud: int = 115200,
-    serial_dry_run: bool = False,
+    onnx_path: Optional[str] = None,
+    model_path: Optional[str] = None,
+    backend: Optional[str] = None,
+    device: Optional[Union[str, torch.device]] = None,
     profile: Optional[str] = None,
+    *,
+    model: Optional[torch.nn.Module] = None,
+    detector: Optional[ObstacleDetector] = None,
+    source: Union[int, str] = 0,
+    checkpoint: Optional[str] = None,
     fast: bool = False,
     use_tensorrt: bool = False,
     camera_height_m: Optional[float] = None,
     hfov_deg: Optional[float] = None,
     vfov_deg: Optional[float] = None,
     hood_polygon: Optional[str] = None,
-    verbose: bool = False,
+    speed_mps: Optional[float] = None,
     use_onnx: bool = False,
     use_int8: bool = False,
-    backend: Optional[str] = None,
     seg_every: Optional[int] = None,
-    out_dir: Optional[Union[str, Path]] = None,
-) -> Dict[str, Any]:
-    if out_dir is not None:
-        out_dir_path = Path(out_dir)
-    else:
-        out_dir_path = Path(output_path).parent
-    out_dir_path.mkdir(parents=True, exist_ok=True)
+) -> LivePipeline:
+    """Construct the video/closed-loop pipeline without opening a video source.
 
-    # Safeguard check on basename
-    if isinstance(source, str) and not force:
-        base_lower = Path(source).name.lower()
-        if "result" in base_lower or "annotated" in base_lower:
-            err_msg = (
-                f"ABORT: Source video basename '{Path(source).name}' contains 'result' or 'annotated'. "
-                f"ALWAYS test on the ORIGINAL RAW dashcam video. Use --force to override."
-            )
-            logger.error(err_msg)
-            return {"error": err_msg, "frames": 0, "packets": []}
-
+    process_frame speed is metres/second; Command.angle is degrees (right positive),
+    and Command.speed is metres/second for the configured scaled vehicle.
+    A null or 'none' hood polygon disables hood masking for direct construction.
+    """
+    checkpoint = model_path or checkpoint
+    if onnx_path is not None:
+        cfg["inference"]["_onnx_path_override"] = str(onnx_path)
+        use_onnx = True
+    if hood_polygon is None and (cfg["inference"].get("hood_polygon") is None or str(cfg["inference"].get("hood_polygon")).lower() == "none"):
+        hood_polygon = "none"
     set_global_seed(cfg["seed"])
-    device = get_device()
+    device = torch.device(device) if device is not None else get_device()
     inf = cfg["inference"]
 
     # Set torch threads to physical cores
@@ -1374,7 +1361,80 @@ def run_video(
         device=device,
         use_tensorrt=use_tensorrt,
     )
-    pipeline = LivePipeline(cfg, model, device, detector, profile_name=profile, onnx_session=onnx_session)
+    return LivePipeline(cfg, model, device, detector, profile_name=profile, onnx_session=onnx_session)
+
+
+
+def run_video(
+    cfg: Dict[str, Any],
+    source: Union[int, str],
+    output_path: str,
+    model: Optional[torch.nn.Module] = None,
+    checkpoint: Optional[str] = None,
+    detector: Optional[ObstacleDetector] = None,
+    max_frames: Optional[int] = None,
+    display: Optional[bool] = None,
+    max_width: Optional[int] = 1280,
+    log_features: Optional[str] = None,
+    speed_mps: Optional[float] = None,
+    force: bool = False,
+    imu_csv: Optional[str] = None,
+    serial_port: Optional[str] = None,
+    serial_baud: int = 115200,
+    serial_dry_run: bool = False,
+    profile: Optional[str] = None,
+    fast: bool = False,
+    use_tensorrt: bool = False,
+    camera_height_m: Optional[float] = None,
+    hfov_deg: Optional[float] = None,
+    vfov_deg: Optional[float] = None,
+    hood_polygon: Optional[str] = None,
+    verbose: bool = False,
+    use_onnx: bool = False,
+    use_int8: bool = False,
+    backend: Optional[str] = None,
+    seg_every: Optional[int] = None,
+    out_dir: Optional[Union[str, Path]] = None,
+) -> Dict[str, Any]:
+    if out_dir is not None:
+        out_dir_path = Path(out_dir)
+    else:
+        out_dir_path = Path(output_path).parent
+    out_dir_path.mkdir(parents=True, exist_ok=True)
+
+    # Safeguard check on basename
+    if isinstance(source, str) and not force:
+        base_lower = Path(source).name.lower()
+        if "result" in base_lower or "annotated" in base_lower:
+            err_msg = (
+                f"ABORT: Source video basename '{Path(source).name}' contains 'result' or 'annotated'. "
+                f"ALWAYS test on the ORIGINAL RAW dashcam video. Use --force to override."
+            )
+            logger.error(err_msg)
+            return {"error": err_msg, "frames": 0, "packets": []}
+
+    # Preserve video-only automatic hood calibration; direct builders never calibrate.
+    if hood_polygon is None and cfg["inference"].get("hood_polygon") is None:
+        from inference.hood_calibration import calibrate_or_load_hood_polygon
+        try:
+            poly = calibrate_or_load_hood_polygon(source)
+            if poly is not None:
+                cfg["inference"]["hood_polygon"] = poly
+        except Exception as exc:
+            logger.warning("Hood calibration failed: %s", exc)
+    pipeline = build_live_pipeline(
+        cfg, backend=backend, profile=profile, model=model, detector=detector,
+        source=source, checkpoint=checkpoint, fast=fast, use_tensorrt=use_tensorrt,
+        camera_height_m=camera_height_m, hfov_deg=hfov_deg, vfov_deg=vfov_deg,
+        hood_polygon=hood_polygon, speed_mps=speed_mps, use_onnx=use_onnx,
+        use_int8=use_int8, seg_every=seg_every,
+    )
+    inf = cfg["inference"]
+    device = pipeline.device
+    profile = profile or ("quality" if torch.cuda.is_available() else "cpu")
+    if fast:
+        profile = "fast"
+    live = isinstance(source, int) or str(source).lower().startswith(("rtsp://", "http://", "https://"))
 
     stop, errors = threading.Event(), []
     frame_q = queue.Queue(maxsize=inf.get("queue_size", 8))

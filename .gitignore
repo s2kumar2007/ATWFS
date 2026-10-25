@@ -20,3 +20,9 @@ outputs/test_stability/
 outputs/check_frames_v4/
 outputs/steer_debug.csv
 outputs/run_summary.txt
+
+# Generated simulation and model artifacts
+weights/.yolov8n.pt.*.part
+yolov8n.onnx
+check_frames/
+outputs/
