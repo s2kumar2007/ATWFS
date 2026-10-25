@@ -22,7 +22,7 @@ class MockActor:
     def get_velocity(self): return type("V",(),dict(x=self.world.speed,y=0.,z=0.))()
     def get_location(self): return type("L",(),dict(x=self.world.position,y=0.,z=0.))()
     def get_transform(self): return type("T",(),dict(location=self.get_location(),rotation=type("R",(),dict(yaw=0.))()))()
-    def get_physics_control(self): return type("P",(),dict(wheels=[type("W",(),dict(max_steer_angle=35.))() for _ in range(4)]))()
+    def get_physics_control(self): return type("P",(),dict(wheels=[type("W",(),dict(max_steer_angle=35.,position=type("P",(),dict(x=x))()))() for x in (-135,-135,135,135)]))()
     def apply_control(self,c): self.world.control=c
     def set_autopilot(self,*a): pass
     def set_transform(self,*a): pass
@@ -55,7 +55,7 @@ class MockWorld:
         dt=self.settings.fixed_delta_seconds or .05; c=self.control
         self.speed=max(0.,self.speed+(c.throttle*2.0-c.brake*5.0)*dt); self.position+=self.speed*dt; self.frame+=1
         for a in self.actors:
-            if a.alive and a.kind=="rgb": a.callback(type("Image",(),dict(raw_data=np.full((478,848,4),120,np.uint8).tobytes(),width=848,height=478,frame=self.frame))())
+            if a.alive and a.kind in ("rgb","semantic"): a.callback(type("Image",(),dict(raw_data=np.full((478,848,4),120,np.uint8).tobytes(),width=848,height=478,frame=self.frame))())
         return self.frame
 
 class MockClient:

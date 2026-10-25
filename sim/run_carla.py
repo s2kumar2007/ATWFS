@@ -1,5 +1,5 @@
 """Run CARLA bridge; use --mock for CPU-only integration."""
-import argparse, logging
+import argparse, logging, json
 from datetime import datetime
 from pathlib import Path
 import torch
@@ -17,8 +17,10 @@ def main(argv=None):
   pipe=build_live_pipeline(cfg,onnx_path=a.onnx_path,backend='onnx' if a.onnx_path else None,device='cuda' if torch.cuda.is_available() else 'cpu',hood_polygon='none')
   with CarlaBridge(a.mock,a.host,a.port,pipeline=pipe,latency_mode=a.latency_mode,v_max=a.v_max_mps,log_dir=out) as bridge: metrics=bridge.run(a.seconds)
   print(metrics)
-  if a.smoke and (metrics['frames']<int(a.seconds/.05) or metrics['commands']==0): raise RuntimeError('Smoke test failed: camera frames or applied commands missing.')
+  logging.info("Measured mock=%s metrics=%s",a.mock,metrics)
+  (out/'metrics.json').write_text(json.dumps(dict(mock=a.mock,**metrics),indent=2),encoding='utf-8')
+  if a.smoke and (metrics['frames']<int(a.seconds/.05) or metrics['commands']==0 or metrics['distance_m']<=0.01): raise RuntimeError('Smoke test failed: camera frames, applied commands, or vehicle movement missing.')
   return 0
  except KeyboardInterrupt: print('Interrupted; restoring CARLA state and destroying actors.'); return 130
- except Exception as e: print(f'CARLA run failed: {e}'); return 1
+ except Exception as e: logging.exception('CARLA run failed'); print(f'CARLA run failed: {e}'); return 1
 if __name__=='__main__':raise SystemExit(main())
