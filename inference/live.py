@@ -58,6 +58,7 @@ class LivePipeline:
         detector: ObstacleDetector,
         profile_name: str = "cpu",
         onnx_session: Optional[Any] = None,
+        fusion_override: Optional[ATWFS] = None,
     ) -> None:
         self.cfg = cfg
         if isinstance(device, str):
@@ -75,7 +76,7 @@ class LivePipeline:
 
         self.detector = detector
         self.classical = ClassicalFreeSpaceEstimator(cfg["classical"])
-        self.fusion = ATWFS(cfg["fusion"])
+        self.fusion = fusion_override if fusion_override is not None else ATWFS(cfg["fusion"])
         self.ipm = InversePerspectiveMapping(cfg["camera"])
         self.ipm_every_n = int(cfg.get("inference", {}).get("ipm_every_n", 10 if device.type == "cpu" else 5))
         self.fallback_alpha_gate = float(cfg.get("inference", {}).get("fallback_alpha_gate", 0.8))
@@ -1190,6 +1191,8 @@ def build_live_pipeline(
     A null or 'none' hood polygon disables hood masking for direct construction.
     """
     checkpoint = model_path or checkpoint
+    if onnx_path is not None and not Path(onnx_path).is_file():
+        raise FileNotFoundError(f"ONNX model not found: {onnx_path}. Supply an existing exported student checkpoint.")
     if onnx_path is not None:
         cfg["inference"]["_onnx_path_override"] = str(onnx_path)
         use_onnx = True
@@ -1315,7 +1318,11 @@ def build_live_pipeline(
                 opts.inter_op_num_threads = 1
                 opts.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
                 opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
-                onnx_session = onnxruntime.InferenceSession(str(onnx_path), opts, providers=["CPUExecutionProvider"])
+                onnx_session = onnxruntime.InferenceSession(str(onnx_path), opts, providers=(["CUDAExecutionProvider", "CPUExecutionProvider"] if device.type == "cuda" and "CUDAExecutionProvider" in onnxruntime.get_available_providers() else ["CPUExecutionProvider"]))
+                input_shape = onnx_session.get_inputs()[0].shape
+                if len(input_shape) == 4 and all(isinstance(n, int) for n in input_shape[-2:]):
+                    inf["input_size"] = list(input_shape[-2:])
+                logger.info("ONNX providers: %s", onnx_session.get_providers())
                 onnx_name = onnx_path.name
                 # Warm-up pass
                 try:
@@ -1325,6 +1332,8 @@ def build_live_pipeline(
                     pass
                 logger.info("Loaded ONNX runtime model from %s (%d threads)", onnx_path, min(6, physical_cores))
         except Exception as exc:
+            if inf.get("_onnx_path_override"):
+                raise RuntimeError(f"Cannot initialize requested ONNX model {inf['_onnx_path_override']}: {exc}") from exc
             logger.warning("ONNX runtime initialization failed (%s); continuing with PyTorch model.", exc)
 
     # Device & Environment Startup Logging
@@ -1343,7 +1352,7 @@ def build_live_pipeline(
     print(f"  Active profile: {profile}")
     print(f"  Detector: {inf['detector'].get('weights')} @ imgsz {inf['detector'].get('imgsz')} (every {inf['detector'].get('every_n')} frames)")
 
-    if model is None:
+    if model is None and onnx_session is None:
         ck = Path(checkpoint) if checkpoint else resolve_path(inf["checkpoint"])
         if ck.exists():
             model, _ = load_model_from_checkpoint(str(ck), device)

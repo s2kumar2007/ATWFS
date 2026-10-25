@@ -1,13 +1,15 @@
 from types import SimpleNamespace
 import pytest
+import numpy as np
+from inference.decision import Command
 from utils.config import load_config
 from sim.carla_bridge import CarlaBridge, command_to_control
 
 class Pipeline:
-    def __init__(self, fail=False): self.cfg=load_config(); self.fail=fail
+    def __init__(self, fail=False): self.cfg=load_config(); self.fail=fail; self.device=SimpleNamespace(type="cpu")
     def process_frame(self,*args):
         if self.fail: raise RuntimeError('injected inference failure')
-        return SimpleNamespace(command=SimpleNamespace(angle=0.,speed=1.5))
+        return SimpleNamespace(command=Command(0.,1.5,1.,False,1.,424.,0.),mask=np.ones((478,848),np.uint8),detections=[])
 
 def test_scaled_speed_reaches_vehicle_cap():
     c,_=command_to_control(SimpleNamespace(angle=0.,speed=1.5),speed=5.,vmax=6.)

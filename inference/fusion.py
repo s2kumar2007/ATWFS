@@ -115,6 +115,7 @@ class ATWFS:
             net: Optional pre-built (e.g. trained) FusionNet; defaults to heuristic-initialised placeholder.
         """
         self.cfg = fusion_cfg
+        self.checkpoint_path = None
         if net is None:
             from pathlib import Path
             ckpt_paths = [
@@ -135,6 +136,7 @@ class ATWFS:
                         loaded_net.load_state_dict(state)
                         logger.info("Loaded trained FusionNet from %s", cp)
                         net = loaded_net
+                        self.checkpoint_path = str(cp)
                         loaded = True
                         break
                     except Exception as e:

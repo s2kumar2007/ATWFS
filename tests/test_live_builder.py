@@ -55,5 +55,10 @@ def test_builder_matches_video_frame(tmp_path, monkeypatch):
                     np.testing.assert_array_equal(av, bv)
                 else:
                     assert av == bv, f.name
-        elif field.name != 'ipm':
+        elif field.name == 'ipm' and a is not None:
+            for f in fields(a):
+                av,bv=getattr(a,f.name),getattr(b,f.name)
+                if isinstance(av,np.ndarray):np.testing.assert_array_equal(av,bv)
+                else:assert av==bv,f.name
+        else:
             assert a == b, field.name

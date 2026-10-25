@@ -377,6 +377,19 @@ class YOLODetector(ObstacleDetector):
             )
         self._last_shape = (h, w)
 
+        # Closed-loop simulation must account for full detection time instead of
+        # hiding work in an asynchronous thread. Default video behavior is unchanged.
+        if self.cfg.get("synchronous", False):
+            if self._last_tracker_frame is None or frame_idx % self.every_n == 0:
+                active_start = time.perf_counter()
+                self._update_tracker_with_dets(self._run_active_pass(bgr, frame_idx), frame_idx)
+                self.active_pass_samples.append((time.perf_counter() - active_start) * 1000.)
+            else:
+                self._step_tracker_forward(frame_idx)
+            self.overhead_samples.append((time.perf_counter() - t0) * 1000.)
+            return [d for d in self._last_active_dets
+                    if frame_idx - self.last_real_detection_frame.get(d.tracker_id, -999) <= self.expiry_frames]
+
         # 0. Frame 0 / scene start synchronous detection pass
         if self._last_tracker_frame is None:
             t_sync0 = time.perf_counter()
