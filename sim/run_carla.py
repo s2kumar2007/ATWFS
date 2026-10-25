@@ -20,6 +20,7 @@ from inference.detector import Detection, NullDetector
 from sim.carla_bridge import CarlaBridge, latency_ticks
 from sim.carla_scenarios import SCENARIOS, Scenario, make_scenarios
 from sim.carla_metrics import Recorder
+from sim.reporting import full_summary, write_csv
 from utils.config import load_config, resolve_path
 
 log=logging.getLogger(__name__)
@@ -86,21 +87,8 @@ def build_pipeline(args):
                      providers=pipe.onnx_session.get_providers() if pipe.onnx_session else [str(pipe.device)])
 
 def write_results(out,records,meta,expected):
-    rows=[]
-    for name in dict.fromkeys(r['scenario'] for r in records):
-        group=[r for r in records if r['scenario']==name];collisions=sum(r['collisions'] for r in group)
-        def mean(key):
-            values=[r[key] for r in group if r.get(key) is not None]
-            return sum(values)/len(values) if values else None
-        rows.append(dict(scenario=name,runs=len(group),collisions=collisions,
-            status='PASS' if len(group)==expected and collisions==0 else 'FAIL',
-            triggered_runs=sum(bool(r.get('triggered')) for r in group),functional_success_runs=sum(bool(r.get('functional_success')) for r in group),
-            distance_m=mean('distance_m'),pipeline_fps=mean('pipeline_fps'),latency_mean_ms=mean('latency_mean_ms'),
-            lane_deviation_rms_m=mean('lane_deviation_rms_m'),drivable_iou_mean=mean('drivable_iou_mean'),
-            reaction_time_s=mean('reaction_time_s'),supervisor_override_ticks=sum(r.get('supervisor_override_ticks',0) for r in group)))
-    with open(out/'summary.csv','w',newline='',encoding='utf-8') as f:
-        if rows:
-            writer=csv.DictWriter(f,fieldnames=list(rows[0]));writer.writeheader();writer.writerows(rows)
+    rows=full_summary(records,expected)
+    write_csv(out/'summary.csv',rows)
     (out/'metrics.json').write_text(json.dumps(dict(metadata=meta,summary=rows,runs=records),indent=2,allow_nan=False),encoding='utf-8')
     return rows
 
@@ -109,6 +97,8 @@ def main(argv=None):
     p.add_argument('--host',default='localhost');p.add_argument('--port',type=int,default=2000);p.add_argument('--town',default='Town01')
     p.add_argument('--mock',action='store_true');p.add_argument('--mock-perception',choices=['synthetic','real'],default='synthetic')
     p.add_argument('--smoke',action='store_true');p.add_argument('--scenario',choices=['all',*SCENARIOS],default='lane_follow')
+    p.add_argument('--miss-detections',type=float,default=0.);p.add_argument('--sensor-dropout-seconds',type=float,default=0.);p.add_argument('--disable-supervisor',action='store_true')
+    p.add_argument('--trigger-distance-m',type=float);p.add_argument('--start-distance-m',type=float)
     p.add_argument('--runs',type=int,default=1);p.add_argument('--seed',type=int,default=0);p.add_argument('--seconds',type=float,default=20.)
     p.add_argument('--onnx-path');p.add_argument('--model-path');p.add_argument('--detector-weights',default='yolov8n.pt')
     p.add_argument('--latency-mode',default='real');p.add_argument('--v-max-mps',type=float,default=6.);p.add_argument('--decel-mps2',type=float,default=4.)
@@ -117,12 +107,15 @@ def main(argv=None):
     args=p.parse_args(argv)
     if args.interfaces:interfaces();return 0
     if args.runs<1 or not math.isfinite(args.seconds) or args.seconds<=0 or not math.isfinite(args.v_max_mps) or args.v_max_mps<=0 or not math.isfinite(args.decel_mps2) or args.decel_mps2<=0:p.error('runs, seconds, v-max-mps and decel-mps2 must be positive.')
+    if not 0<=args.miss_detections<=1 or not math.isfinite(args.sensor_dropout_seconds) or args.sensor_dropout_seconds<0:p.error('Miss rate must be in [0,1]; dropout duration must be nonnegative.')
+    for value in (args.trigger_distance_m,args.start_distance_m):
+        if value is not None and (not math.isfinite(value) or value<=0):p.error('Scenario distance overrides must be positive.')
     try:latency_ticks(args.latency_mode,0.)
     except ValueError as e:p.error(str(e))
     out=args.output_dir or Path('outputs/sim_carla')/datetime.now().strftime('%Y%m%d_%H%M%S_%f')
     out.mkdir(parents=True,exist_ok=True)
     pipe=None;records=[];meta=dict(torch_version=torch.__version__,cuda_available=torch.cuda.is_available(),mock=args.mock,seed=args.seed,dt_s=.05,latency_mode=args.latency_mode,
-        v_max_mps=args.v_max_mps,carla_validation='not run: needs CARLA' if args.mock else 'executing CARLA',
+        missed_detection_rate=args.miss_detections,sensor_dropout_seconds=args.sensor_dropout_seconds,supervisor_enabled=not args.disable_supervisor,trigger_distance_m=args.trigger_distance_m,start_distance_m=args.start_distance_m,v_max_mps=args.v_max_mps,carla_validation='not run: needs CARLA' if args.mock else 'executing CARLA',
         fusion='existing ATWFS loader selects available trained fusion checkpoint or heuristic fallback; selection is logged',traffic_rule_source='CARLA light state / stop actor stand-ins',
         ground_truth_usage='scenario orchestration and evaluation only',held_out_test_miou=None,
         historical_model_card_student_validation_miou=.9415,seconds_per_run=10. if args.smoke else args.seconds)
@@ -140,7 +133,12 @@ def main(argv=None):
             pipe,source=build_pipeline(args);meta.update(source);meta['fusion_checkpoint']=pipe.fusion.checkpoint_path;meta['fusion_sha256']=sha256(pipe.fusion.checkpoint_path) if pipe.fusion.checkpoint_path else None;print('Perception: '+source['perception'])
             if not args.mock:print('Dedicated CARLA server required: each seeded run reloads the requested town. Traffic rules use simulator-state stand-ins.')
             names=['smoke'] if args.smoke else list(SCENARIOS) if args.scenario=='all' else [args.scenario]
-            params=make_scenarios(args.seed,args.runs);n=1 if args.smoke else args.runs
+            params=make_scenarios(args.seed,args.runs)
+            for group in params.values():
+                for item in group:
+                    if args.trigger_distance_m is not None:item['trigger_distance']=args.trigger_distance_m
+                    if args.start_distance_m is not None:item['start_distance_m']=args.start_distance_m
+            n=1 if args.smoke else args.runs
             for name in names:
                 recorder=None
                 try:
@@ -150,7 +148,7 @@ def main(argv=None):
                         scenario=None if args.smoke else Scenario(name,params[name][j])
                         seed=args.seed if scenario is None else scenario.params['seed']
                         with CarlaBridge(args.mock,args.host,args.port,pipeline=pipe,latency_mode=args.latency_mode,
-                                         v_max=args.v_max_mps,log_dir=out,town=args.town,seed=seed,reload_world=not args.mock,decel=args.decel_mps2) as bridge:
+                                         v_max=args.v_max_mps,log_dir=out,town=args.town,seed=seed,reload_world=not args.mock,decel=args.decel_mps2,missed_detection_rate=args.miss_detections,sensor_dropout_seconds=args.sensor_dropout_seconds,supervisor_enabled=not args.disable_supervisor) as bridge:
                             result=bridge.run(meta['seconds_per_run'],scenario,recorder,j+1,('MOCK - ' if args.mock else 'CARLA - ')+source['perception'])
                         result.update(scenario=name,run=j+1,seed=seed,parameters=None if scenario is None else scenario.params);records.append(result)
                         write_results(out,records,meta,n)
@@ -160,7 +158,7 @@ def main(argv=None):
                     if recorder:recorder.close()
             rows=write_results(out,records,meta,n)
             print('\nSCENARIO             RUNS COLLISIONS STATUS TRIGGERED FUNCTIONAL PIPELINE_FPS LATENCY_MS')
-            for r in rows:print(f"{r['scenario']:<20} {r['runs']:>4} {r['collisions']:>10} {r['status']:>6} {r['triggered_runs']:>9} {r['functional_success_runs']:>10} {r['pipeline_fps'] or 0:>12.2f} {r['latency_mean_ms'] or 0:>10.2f}")
+            for r in rows:print(f"{r['scenario']:<20} {r['runs']:>4} {r['collisions']:>10} {r['status']:>6} {r.get('triggered_runs',0):>9} {r.get('functional_success_runs',0):>10} {r['pipeline_fps'] or 0:>12.2f} {r['latency_mean_ms'] or 0:>10.2f}")
             print('Reports and videos: '+str(out));return 2 if any(r['collisions'] for r in rows) else 0
         except KeyboardInterrupt:
             meta['error']='Interrupted by user';write_results(out,records,meta,1 if args.smoke else args.runs)

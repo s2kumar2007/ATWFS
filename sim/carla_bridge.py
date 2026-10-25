@@ -9,6 +9,7 @@ import re
 import time
 import numpy as np
 from sim.supervisor import SafetySupervisor
+from sim.faults import MissedDetections, in_dropout
 from sim.carla_scenarios import TrafficRuleStandIn
 from sim.carla_metrics import Metrics, truth_snapshot
 
@@ -53,8 +54,12 @@ def wheel_geometry(wheels):
     return wheelbase,steer,unit
 
 class CarlaBridge:
-    def __init__(self,mock=False,host='localhost',port=2000,pipeline=None,latency_mode='real',v_max=6.,log_dir=None,town='Town01',seed=0,reload_world=False,decel=4.,enable_rules=True):
+    def __init__(self,mock=False,host='localhost',port=2000,pipeline=None,latency_mode='real',v_max=6.,log_dir=None,town='Town01',seed=0,reload_world=False,decel=4.,enable_rules=True,missed_detection_rate=0.,sensor_dropout_seconds=0.,supervisor_enabled=True):
         latency_ticks(latency_mode,0.)
+        if not math.isfinite(missed_detection_rate) or not 0<=missed_detection_rate<=1:raise ValueError('Missed detections must be a fraction in [0,1].')
+        if not math.isfinite(sensor_dropout_seconds) or sensor_dropout_seconds<0:raise ValueError('Sensor dropout duration must be nonnegative.')
+        self.missed_detection_rate=missed_detection_rate;self.sensor_dropout_seconds=sensor_dropout_seconds
+        self.supervisor_enabled=supervisor_enabled;self.base_detector=None;self.fault_detector=None
         self.mock=mock;self.pipeline=pipeline;self.latency_mode=latency_mode;self.v_max=v_max
         if mock:
             from sim.mock_carla import MockCarla
@@ -136,51 +141,68 @@ class CarlaBridge:
     def run(self,seconds=10,scenario=None,recorder=None,run_id=1,label='ATWFS'):
         if not math.isfinite(seconds) or seconds<=0:raise ValueError('Simulation duration must be positive.')
         self.setup()
+        if hasattr(self.pipeline,'detector'):
+            self.base_detector=self.pipeline.detector
+            self.fault_detector=MissedDetections(self.base_detector,self.missed_detection_rate,self.seed)
+            self.pipeline.detector=self.fault_detector
+        self.log_event('negative_control',missed_detection_rate=self.missed_detection_rate,sensor_dropout_seconds=self.sensor_dropout_seconds,supervisor_enabled=self.supervisor_enabled)
         if scenario is not None:scenario.start(self)
         start=self.vehicle.get_location();distance=0.;last_location=start;steps=int(round(seconds/DT))
-        pending=[];latest=-1;active=None;pid=SpeedPID();metrics=Metrics(self.decel)
+        pending=[];latest=-1;active=None;last_result=None;dropout_ticks=0;pid=SpeedPID();metrics=Metrics(self.decel)
         control=dict(steer=0.,throttle=0.,brake=1.);t0=time.perf_counter()
         for i in range(steps):
             t=i*DT;vel=self.vehicle.get_velocity();speed=math.sqrt(vel.x**2+vel.y**2+vel.z**2)
             if scenario is not None:scenario.update(t,speed)
             idx=self.world.tick();frame=self.sensor_frame(self.frames,idx);semantic=self.sensor_frame(self.semantic,idx)
             vel=self.vehicle.get_velocity();speed=math.sqrt(vel.x**2+vel.y**2+vel.z**2)
-            before=time.perf_counter();result=self.pipeline.process_frame(frame,i,DT,speed,None)
-            if self.pipeline.device.type=='cuda':
-                import torch
-                torch.cuda.synchronize(self.pipeline.device)
-            latency=time.perf_counter()-before;self.latencies.append(latency)
-            heapq.heappush(pending,(i+latency_ticks(self.latency_mode,latency),i,result))
+            dropout=in_dropout(t,scenario.trigger_time if scenario is not None else None,self.sensor_dropout_seconds)
+            latency=None
+            if not dropout:
+                before=time.perf_counter();result=self.pipeline.process_frame(frame,i,DT,speed,None)
+                if self.pipeline.device.type=='cuda':
+                    import torch
+                    torch.cuda.synchronize(self.pipeline.device)
+                latency=time.perf_counter()-before;self.latencies.append(latency);last_result=result
+                heapq.heappush(pending,(i+latency_ticks(self.latency_mode,latency),i,result))
+            else:
+                dropout_ticks+=1;result=last_result
+                self.log_event('sensor_dropout',tick=i,time=t)
             while pending and pending[0][0]<=i:
                 _,seq,item=heapq.heappop(pending)
                 if seq>latest:active=item;latest=seq;self.applied+=1
             reasons=['waiting for delayed command'] if active is None else []
             if active is not None:
-                supervised=self.supervisor.step(active,speed,DT,self.vehicle_wheelbase,self.pipeline_vmax,self.v_max)
-                control,_=command_to_control(supervised.command,self.max_steer,self.v_max,speed,pipeline_vmax=self.pipeline_vmax)
-                target=float(np.clip(supervised.command.speed/self.pipeline_vmax,0,1))*self.v_max
+                if self.supervisor_enabled:
+                    supervised=self.supervisor.step(active,speed,DT,self.vehicle_wheelbase,self.pipeline_vmax,self.v_max)
+                    command=supervised.command;reasons=supervised.reasons;emergency=supervised.emergency
+                else:
+                    command=active.command;reasons=[];emergency=False
+                control,_=command_to_control(command,self.max_steer,self.v_max,speed,pipeline_vmax=self.pipeline_vmax)
+                target=float(np.clip(command.speed/self.pipeline_vmax,0,1))*self.v_max
                 control['throttle'],control['brake']=pid.update(target,speed)
-                reasons=supervised.reasons
-                if supervised.emergency:control.update(throttle=0.,brake=1.)
+                if emergency:control.update(throttle=0.,brake=1.)
             rule=self.rules.reason(self,t,speed) if self.enable_rules else None
             if rule:control.update(throttle=0.,brake=1.);reasons=reasons+[rule]
             self.vehicle.apply_control(self.carla.VehicleControl(**control))
-            if reasons:self.log_event('supervisor_override',tick=i,reasons=reasons)
+            if reasons:self.log_event('control_hold' if reasons==['waiting for delayed command'] else 'supervisor_override',tick=i,reasons=reasons)
             # Truth is collected only AFTER the control decision, and never passed to the supervisor.
             truth=truth_snapshot(self,scenario,semantic)
-            metrics.update(t,truth,speed,control['brake'],latency,reasons,result.mask if i%10==0 else None,semantic if i%10==0 else None,bool(rule))
+            metrics.update(t,truth,speed,control['brake'],latency,[r for r in reasons if r!='waiting for delayed command'],result.mask if result is not None and i%10==0 and not dropout else None,semantic if i%10==0 and not dropout else None,bool(rule))
             loc=self.vehicle.get_location();distance+=loc.distance(last_location);last_location=loc
-            self.log_event('tick',tick=i,speed_mps=speed,position=(loc.x,loc.y,loc.z),angle_deg=control['steer']*self.max_steer,trust=result.command.trust,latency_ms=latency*1000)
-            if recorder is not None:recorder.write(frame,result,run_id,t,speed,control,reasons,label)
+            self.log_event('tick',tick=i,speed_mps=speed,position=(loc.x,loc.y,loc.z),angle_deg=control['steer']*self.max_steer,trust=result.command.trust if result is not None else None,latency_ms=latency*1000 if latency is not None else None,sensor_dropout=dropout,applied_frame=latest,brake=control['brake'],throttle=control['throttle'])
+            if recorder is not None and result is not None:recorder.write(frame,result,run_id,t,speed,control,reasons+(['RGB SENSOR DROPOUT'] if dropout else []),label)
             if i%100==0:print(f'run={run_id} tick={i}/{steps} speed={speed:.2f} m/s collisions={len(self.collisions)}')
         # Final tick collision callbacks can lag; synchronous sensor callbacks have already arrived.
         summary=dict(distance_m=distance,collisions=len(self.collisions),frames=steps,commands=self.applied,
-                     fps=steps/max(1e-6,time.perf_counter()-t0),latency_ms=float(np.mean(self.latencies)*1000),**metrics.summary())
+                     fps=steps/max(1e-6,time.perf_counter()-t0),latency_ms=float(np.mean(self.latencies)*1000) if self.latencies else None,processed_frames=len(self.latencies),sensor_dropout_ticks=dropout_ticks,supervisor_enabled=self.supervisor_enabled,**metrics.summary())
+        if self.fault_detector is not None:summary.update(self.fault_detector.stats())
+        summary['target_collisions']=sum(1 for event in self.collisions if scenario is not None and scenario.actor is not None and event.other_actor.id==scenario.actor.id)
         if scenario is not None:summary.update(scenario.outcome(len(self.collisions)))
         return summary
     def close(self):
         if self.closed:return
         self.closed=True;errors=[]
+        if self.base_detector is not None:self.pipeline.detector=self.base_detector
         for actor in reversed(self.actors):
             try:
                 if actor.type_id.startswith('sensor.'):actor.stop()
