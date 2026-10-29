@@ -19,3 +19,5 @@ Commands were run on Windows with Python from the installed host environment. In
 | Headless display | NOT RUN | Display requires GUI OpenCV; requirements.txt uses headless OpenCV |
 
 Fresh-environment compatibility is BLOCKED by shell package-index access. Installed host versions differ from requirements; see build_health.md. No cross-platform pass is inferred from Windows-only results.
+
+Phase 7 gate: pytest PASS, smoke PASS, pyflakes BLOCKED (not installed). Results under outputs/audit/phase_7/.

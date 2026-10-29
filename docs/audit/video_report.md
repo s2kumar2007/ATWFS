@@ -7,3 +7,6 @@ The real student_v2.onnx and YOLOv8n ran on 300 and 1696 frames. CPU overall FPS
 B027: BLOCKED: YOLOv8n pipeline versus YOLOv8s reference disagreement is not sufficient to identify which detector is wrong. No model weights or confidence definitions are changed to force agreement. Human-labelled detection ground truth is required to certify the remaining misses/ghosts.
 B028: BLOCKED: planned path and rate-limited steering can have opposite signs during a reversal. Removing the safety limiter or hiding those frames would make this check misleading. Commanded-trajectory rendering requires a calibrated vehicle projection; current planned-path sign disagreement remains reported.
 
+
+Visual review of the 12-frame contact sheet: blue masks generally cover the visible road, but leave holes or isolated islands near vehicles and the hood; in the underpass one frame has a large irregular unmasked road region. The yellow planned path sometimes bends toward an edge while the HUD reports straight steering. These are qualitative observations, not labelled accuracy or a physical driving test.
+
