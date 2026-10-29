@@ -105,3 +105,163 @@ def test_detector_thread_failure():
             detector.detect(np.zeros((20,20,3),np.uint8))
     finally:
         detector.stop()
+
+
+def test_low_visibility_counter_reaches_decay():
+    from inference.live import LivePipeline
+    from tests.test_audit_contracts import CaptureONNX
+    import torch
+    cfg=load_config()
+    pipe=LivePipeline(cfg,None,torch.device('cpu'),__import__('inference.detector',fromlist=['NullDetector']).NullDetector(),onnx_session=CaptureONNX())
+    pipe.prev_steer_angle=20
+    counts=[]
+    for i in range(20):
+        pipe.process_frame(np.zeros((72,128,3),np.uint8),frame_idx=i)
+        counts.append(pipe.steer_hold_counter)
+    assert max(counts)>5
+    assert abs(pipe.prev_steer_angle)<1
+
+
+def test_low_trust_nonempty_mask_decays():
+    cfg=load_config()['inference']['decision']
+    previous=20
+    for count in range(20):
+        cmd=compute_command(np.ones((100,200),np.uint8),[],.1,0,cfg,prev_angle=previous,hold_count=count)
+        previous=cmd.angle
+    assert abs(previous)<.1
+    assert cmd.speed <= cfg['crawl_speed_floor']
+
+
+def test_hud_trust_contract():
+    from inference.live import LivePipeline
+    from inference.detector import NullDetector
+    from tests.test_audit_contracts import CaptureONNX
+    import torch
+    cfg=load_config()
+    pipe=LivePipeline(cfg,None,torch.device('cpu'),NullDetector(),onnx_session=CaptureONNX())
+    for i in range(12):
+        result=pipe.process_frame(np.zeros((72,128,3),np.uint8),frame_idx=i)
+        assert (result.active=='FALLBACK') == (result.command.trust<cfg['fusion']['fallback_threshold'])
+
+
+def test_grayscale_png_sequence_is_bgr(tmp_path):
+    import cv2
+    from inference.live import FrameGrabber
+    for i in range(3):
+        assert cv2.imwrite(str(tmp_path/f'frame_{i:03d}.png'),np.full((20,30),100,np.uint8))
+    q=queue.Queue()
+    errors=[]
+    grabber=FrameGrabber(str(tmp_path/'frame_%03d.png'),q,threading.Event(),False,errors=errors)
+    grabber.run()
+    assert not errors
+    assert q.qsize()==4
+    assert q.get()[1].shape==(20,30,3)
+
+
+def test_camera_size_change_stops_capture(monkeypatch):
+    from inference.live import FrameGrabber
+    class Capture:
+        def __init__(self): self.n=0
+        def isOpened(self): return True
+        def get(self,prop): return 25 if prop==5 else 2
+        def read(self):
+            self.n+=1
+            return True,np.zeros((20+self.n,30,3),np.uint8)
+        def release(self): pass
+    monkeypatch.setattr('inference.live.cv2.VideoCapture',lambda _:Capture())
+    errors=[];stop=threading.Event()
+    grabber=FrameGrabber('fake',queue.Queue(),stop,False,errors=errors)
+    grabber.run()
+    assert stop.is_set() and 'size changed' in str(errors[0])
+
+
+def test_missing_serial_and_write_failure(monkeypatch):
+    import sys
+    import types
+    def fail(**kwargs): raise OSError('injected missing port')
+    monkeypatch.setitem(sys.modules,'serial',types.SimpleNamespace(Serial=fail))
+    with pytest.raises(OSError,match='Requested serial port unavailable'):
+        SerialSender(port='missing-test-port')
+    class BadPort(MockSerialPort):
+        def write(self,data): raise OSError('injected write failure')
+    sender=SerialSender(serial_conn=BadPort())
+    try:
+        with pytest.raises(OSError,match='Serial write failed'):
+            sender.send(0,1,1,0)
+        assert sender._estop
+    finally:
+        sender.close()
+
+
+def test_threaded_detector_stale_result_expires():
+    from inference.detector import ThreadedDetector, NullDetector
+    detector=ThreadedDetector(NullDetector(),3)
+    try:
+        with detector.lock:
+            detector.latest=[Detection(1,1,10,10,2,'car',.9)]
+            detector.latest_frame=0
+        assert detector.detect(np.zeros((20,20,3),np.uint8),frame_idx=8)==[]
+    finally:detector.stop()
+
+
+def test_imminent_new_track_brakes_without_confirmation():
+    cfg=load_config()['inference']['decision']
+    det=Detection(80,50,120,99,0,'person',.9,tracker_id=99,consecutive_detections=1)
+    cmd=compute_command(np.ones((100,200),np.uint8),[det],1,0,cfg)
+    assert cmd.obstacle_flag
+    assert cmd.speed==0
+
+
+@pytest.mark.parametrize('bad',[0.,-1.,float('nan'),float('inf')])
+def test_invalid_dirichlet_concentrations_are_rejected(bad):
+    import torch
+    from models.unet_mobilenet import evidential_uncertainty,evidential_probs
+    from training.losses import evidential_loss
+    alpha=torch.full((1,2,3,3),bad)
+    for function in (evidential_uncertainty,evidential_probs):
+        with pytest.raises(ValueError,match='Dirichlet concentrations'):
+            function(alpha)
+    with pytest.raises(ValueError,match='Dirichlet concentrations'):
+        evidential_loss(alpha,torch.zeros((1,3,3),dtype=torch.long),.5)
+
+
+def test_worker_forwards_source_dt_and_speed():
+    from types import SimpleNamespace
+    from inference.live import InferenceWorker
+    from inference.decision import Command
+    class Pipeline:
+        timings={'read':0}
+        stage_samples={'read':[]}
+        def process_frame(self,frame,**kwargs):
+            self.kwargs=kwargs
+            return SimpleNamespace(command=Command(0,0,1,False,0,0,0))
+    p=Pipeline();inq=queue.Queue();outq=queue.Queue()
+    inq.put((0,np.zeros((20,30,3),np.uint8),0));inq.put(None)
+    worker=InferenceWorker(p,inq,outq,threading.Event(),1,[],1,fps=20,speed_mps=2.5)
+    worker.run()
+    assert p.kwargs['dt']==.05 and p.kwargs['speed']==2.5
+
+
+def test_estop_stops_speed_without_steering_jump():
+    import ast
+    with SerialSender(dry_run=True) as sender:
+        for _ in range(6):sender.send(30,1,1,0)
+        previous=sender._angle
+        packet=ast.literal_eval(sender.emergency_stop('test'))
+        assert packet[1]==0 and abs(packet[0]-previous)<=5
+
+
+def test_pipeline_starts_with_ramp_state():
+    from inference.live import LivePipeline
+    from inference.detector import NullDetector
+    from tests.test_audit_contracts import CaptureONNX
+    import torch
+    pipe=LivePipeline(load_config(),None,torch.device('cpu'),NullDetector(),onnx_session=CaptureONNX())
+    assert pipe.prev_speed==0 and pipe.prev_steer_angle==0
+
+
+def test_watchdog_has_margin_before_three_hundred_ms_budget():
+    with SerialSender(dry_run=True) as sender:
+        sender.send(0,1,1,0)
+        sender.check_watchdog(sender._last_send+.251)
+        assert sender._estop and ', 0.000,' in sender.history[-1]

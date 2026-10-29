@@ -22,3 +22,4 @@ onnxruntime
 onnx
 pyserial
 pyflakes
+lap>=0.5.12

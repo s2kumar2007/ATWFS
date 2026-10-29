@@ -594,6 +594,7 @@ class ThreadedDetector(ObstacleDetector):
         self.lock = threading.Lock()
         self.latest: List[Detection] = []
         self.error = None
+        self.latest_frame = -999
         self.stop_event = threading.Event()
         self.frame_bgr: Optional[np.ndarray] = None
         self.frame_idx = 0
@@ -621,6 +622,7 @@ class ThreadedDetector(ObstacleDetector):
                 return
             with self.lock:
                 self.latest = dets
+                self.latest_frame = idx
 
     def detect(self, bgr: np.ndarray, frame_idx: int = 0) -> List[Detection]:
         with self.lock:
@@ -632,7 +634,7 @@ class ThreadedDetector(ObstacleDetector):
                 self.frame_idx = frame_idx
                 self.cond.notify()
         with self.lock:
-            return list(self.latest)
+            return list(self.latest) if frame_idx - self.latest_frame <= self.every_n + 4 else []
 
     def stop(self) -> None:
         self.stop_event.set()

@@ -29,7 +29,11 @@ def parse_args():
     return parser.parse_args()
 
 
-def main() -> None:
+def quality_guard_passed(ious) -> bool:
+    return bool(len(ious) and float(np.mean(ious)) >= 0.97)
+
+
+def main() -> int:
     args = parse_args()
     video_path = args.video
     if not Path(video_path).exists():
@@ -47,7 +51,7 @@ def main() -> None:
     before_npz_path = Path("outputs/inference/before_masks_50.npz")
     if not before_npz_path.exists():
         print(f"ERROR: {before_npz_path} not found.")
-        return
+        return 2
 
     before_masks = np.load(before_npz_path)
     cap = cv2.VideoCapture(video_path)
@@ -105,10 +109,12 @@ def main() -> None:
     guard_res = {
         "mean_mask_iou": mean_iou,
         "min_mask_iou": min_iou,
-        "passed": bool(mean_iou >= 0.97),
+        "passed": quality_guard_passed(ious),
     }
     Path("outputs/reports/quality_guard.json").write_text(json.dumps(guard_res, indent=2), encoding="utf-8")
+    pipeline_full.detector.stop()
+    return 0 if guard_res["passed"] else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

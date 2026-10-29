@@ -317,6 +317,11 @@ def build_model(model_cfg: Dict[str, Any], evidence_clip: float = 1000.0) -> Mul
                          model_cfg.get("terrain_hidden", 64), model_cfg.get("terrain_dropout", 0.2), evidence_clip)
 
 
+def _validate_alpha(alpha: torch.Tensor) -> None:
+    if alpha.numel() == 0 or not torch.isfinite(alpha).all() or (alpha <= 0).any():
+        raise ValueError("Dirichlet concentrations must be nonempty, finite and positive")
+
+
 def evidential_uncertainty(alpha: torch.Tensor) -> torch.Tensor:
     """Per-pixel vacuity ``u = K / S`` (S = sum of Dirichlet params); in (0, 1].
 
@@ -326,6 +331,7 @@ def evidential_uncertainty(alpha: torch.Tensor) -> torch.Tensor:
     Returns:
         ``(B,H,W)`` uncertainty.
     """
+    _validate_alpha(alpha)
     return alpha.shape[1] / alpha.sum(dim=1)
 
 
@@ -338,6 +344,7 @@ def evidential_probs(alpha: torch.Tensor) -> torch.Tensor:
     Returns:
         ``(B,K,H,W)`` probabilities.
     """
+    _validate_alpha(alpha)
     return alpha / alpha.sum(dim=1, keepdim=True)
 
 

@@ -184,6 +184,8 @@ def compute_command(
     h, w = mask.shape
     ego_center_px = w / 2.0
 
+    if trust < float(cfg.get("trust_min", 0.3)) and cfg.get("slow_speed_floor") is not None:
+        return _low_vis_command(trust, dets, cfg, prev_angle, hold_count, prev_speed, h, w)
     nz_y, nz_x = np.nonzero(mask)
     if len(nz_y) == 0:
         # No drivable pixels at all — hold/decay angle, crawl
@@ -483,7 +485,7 @@ def _check_obstacles(
         if in_corridor and rel_y > prox:
             prox = rel_y
 
-        is_confirmed = (d.tracker_id is None) or (getattr(d, "consecutive_detections", 1) >= 2)
+        is_confirmed = (d.tracker_id is None) or (getattr(d, "consecutive_detections", 1) >= 2) or rel_y >= 0.85
         has_sustained_growth = getattr(d, "sustained_growth", False) or (d.approach_rate > 1.05 and d.tracker_id is None)
         is_threat = (rel_y >= 0.55) or has_sustained_growth
 
@@ -522,7 +524,7 @@ def _low_vis_command(
             saturating_term = "hold_angle"
         else:
             # Decay towards 0 over decay_frames frames
-            decay_steps = hold_count - hold_frames
+            decay_steps = hold_count - hold_frames + 1
             decay_factor = max(0.0, 1.0 - decay_steps / max(1, decay_frames))
             held = float(prev_angle) * decay_factor
             saturating_term = "decay_angle"

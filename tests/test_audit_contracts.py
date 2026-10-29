@@ -63,7 +63,7 @@ def test_negative_capture_fps(monkeypatch, fps):
         def isOpened(self): return True
         def get(self, prop): return fps if prop == 5 else 0
         def release(self): pass
-    monkeypatch.setattr('inference.live.cv2.VideoCapture',lambda _:Capture())
+    monkeypatch.setattr('inference.live._open_capture',lambda _:Capture())
     grabber=FrameGrabber('sequence_%03d.png',queue.Queue(),threading.Event(),False)
     assert grabber.fps == 25
 
@@ -89,3 +89,58 @@ def test_invalid_dt_is_rejected(dt):
     pipe=LivePipeline(load_config(),None,torch.device('cpu'),NullDetector(),onnx_session=CaptureONNX())
     with pytest.raises(ValueError,match='Frame dt'):
         pipe.process_frame(np.zeros((20,20,3),np.uint8),dt=dt)
+
+
+def test_documented_readme_module_flags_exist():
+    import ast
+    import re
+    readme=Path('README.md').read_text(encoding='utf-8')
+    for line in readme.splitlines():
+        match=re.search(r'python -m ([\w.]+)([^`]*)(?:`|$)',line)
+        if not match: continue
+        module,tail=match.groups()
+        path=Path(*module.split('.')).with_suffix('.py')
+        if not path.is_file(): continue
+        tree=ast.parse(path.read_text(encoding='utf-8'))
+        flags={arg.value for node in ast.walk(tree) if isinstance(node,ast.Call) and isinstance(node.func,ast.Attribute) and node.func.attr=='add_argument' for arg in node.args if isinstance(arg,ast.Constant) and isinstance(arg.value,str) and arg.value.startswith('--')}
+        assert set(re.findall(r'--[a-z][a-z0-9-]*',tail)) <= flags,(module,tail)
+
+
+def test_corrupt_torch_model_has_clear_error(tmp_path):
+    from inference.live import run_video
+    source=tmp_path/'input.mp4';source.write_bytes(b'placeholder')
+    model=tmp_path/'corrupt.pt';model.write_bytes(b'bad checkpoint')
+    with pytest.raises(ValueError,match='Cannot load PyTorch model'):
+        run_video(load_config(),str(source),str(tmp_path/'out.mp4'),checkpoint=str(model),backend='torch',profile='cpu',hood_polygon='none',detector=NullDetector())
+
+
+def test_invalid_hood_polygon_rejected(tmp_path):
+    from inference.live import run_video
+    source=tmp_path/'input.mp4';source.write_bytes(b'placeholder')
+    polygon=tmp_path/'hood.json';polygon.write_text('[[0,0],[1,0],[2,1]]')
+    with pytest.raises(ValueError,match='normalized finite'):
+        run_video(load_config(),str(source),str(tmp_path/'out.mp4'),hood_polygon=str(polygon),detector=NullDetector())
+
+
+def test_auto_export_is_under_run_directory(tmp_path,monkeypatch):
+    from inference.live import run_video
+    cfg=load_config()
+    source=tmp_path/'input.mp4';source.write_bytes(b'placeholder')
+    ck=tmp_path/'model.pt';ck.write_bytes(b'placeholder')
+    out=tmp_path/'run';captured={}
+    def export(checkpoint,dest,*args,**kwargs):
+        captured['dest']=Path(dest)
+        raise RuntimeError('stop after export-path probe')
+    monkeypatch.setattr('scripts.export_onnx.export_to_onnx',export)
+    with pytest.raises(ValueError,match='export-path probe'):
+        run_video(cfg,str(source),str(out/'annotated.mp4'),checkpoint=str(ck),backend='onnx',profile='cpu',out_dir=out,hood_polygon='none',detector=NullDetector())
+    assert captured['dest'].resolve().is_relative_to(out.resolve())
+
+
+def test_cli_missing_input():
+    import subprocess
+    import sys
+    result=subprocess.run([sys.executable,'-m','inference.live','--source','missing-audit-input.mp4'],capture_output=True,text=True)
+    assert result.returncode==2
+    assert 'Input video not found' in result.stderr
+    assert 'Traceback' not in result.stderr

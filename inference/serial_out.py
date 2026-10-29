@@ -83,15 +83,16 @@ class SerialSender:
     def check_watchdog(self, now: Optional[float] = None) -> None:
         with self._lock:
             elapsed = (time.monotonic() if now is None else now) - self._last_send
-            if elapsed > 0.300 and not self._estop:
-                self.emergency_stop("no processed command for more than 300 ms")
+            if elapsed > 0.250 and not self._estop:
+                self.emergency_stop("command freshness guard expired (250 ms; 300 ms safety budget)")
 
     def _watchdog_loop(self) -> None:
-        while not self._closed.wait(0.05):
+        while not self._closed.wait(0.005):
             self.check_watchdog()
 
     def send(self, angle: float, speed: float, trust: float, obstacle_flag: Union[int, bool]) -> str:
         with self._lock:
+            self.check_watchdog()
             return self._send_locked(angle, speed, trust, obstacle_flag)
 
     def _send_locked(
@@ -107,7 +108,8 @@ class SerialSender:
             if not all(math.isfinite(v) for v in values):
                 self._estop = True
             if self._estop:
-                angle, speed, trust, obstacle_flag = 0.0, 0.0, 0.0, 1
+                angle, speed, trust, obstacle_flag = max(self._angle-5.0, min(self._angle+5.0, 0.0)), 0.0, 0.0, 1
+                self._angle, self._speed = angle, speed
             else:
                 angle = max(-30.0, min(30.0, values[0]))
                 angle = max(self._angle - 5.0, min(self._angle + 5.0, angle))

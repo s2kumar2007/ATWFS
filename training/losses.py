@@ -88,6 +88,8 @@ def evidential_loss(alpha: torch.Tensor, target: torch.Tensor, kl_coef: float) -
     Returns:
         ``(total, fit_term)`` scalars.
     """
+    if alpha.numel() == 0 or not torch.isfinite(alpha).all() or (alpha <= 0).any():
+        raise ValueError("Dirichlet concentrations must be nonempty, finite and positive")
     k = alpha.shape[1]
     y = F.one_hot(target, k).permute(0, 3, 1, 2).to(alpha.dtype)
     s = alpha.sum(dim=1, keepdim=True)

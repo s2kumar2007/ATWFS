@@ -94,12 +94,12 @@ tests/                       Comprehensive unit and stage smoke tests
 |---|---|
 | Run all smoke tests (11 stages) | `python run_all_smoke_tests.py` |
 | Run full unit test suite | `pytest` |
-| Calibrate dome hood polygon | `python -m inference.calibrate_roi --source dashcam_raw.mp4 --auto` |
+| Calibrate dome hood polygon | `python -m inference.calibrate_roi --source dashcam_raw.mp4 --preset dome` |
 | Live / raw video inference | `python -m inference.live --source dashcam_raw.mp4 --checkpoint outputs/checkpoints/student_best.pt` |
 | Video inference + IMU + Serial dry-run | `python -m inference.live --source dashcam_raw.mp4 --imu-csv imu.csv --dry-run` |
 | Train teacher on IDD | `python -m training.train` |
 | Distil student | `python -m training.distill` |
-| Fine-tune night decoder | `python -m training.finetune_night --checkpoint outputs/checkpoints/student_best.pt --synthetic` |
+| Fine-tune night decoder | `python -m training.finetune_night --checkpoint outputs/checkpoints/student_best.pt` |
 | Train FusionNet & ablation CSV | `python -m training.fusion_train --checkpoint outputs/checkpoints/student_best.pt` |
 | Evaluate checkpoint (IDD protocol) | `python -m evaluation.evaluate --checkpoint outputs/checkpoints/student_best.pt` |
 | Full held-out test split evaluation | `python -m evaluation.test_split_eval --baseline-checkpoint outputs/checkpoints/student_best.pt --onnx outputs/checkpoints/student_v2.onnx` |
@@ -166,3 +166,21 @@ bash scripts/train_gpu.sh --data-src /path/to/IDD_RESIZED [--resume]
    ```
 
 > **Important Safeguard:** `inference/live.py` inspects the input video basename and refuses to run on already-annotated files (filenames containing `"result"` or `"annotated"`) unless `--force` is explicitly passed. Always test inference on raw dashcam video (`dashcam_raw.mp4`).
+
+## Audit and safe reproduction
+
+The audit branch is `real`; simulation work is separate. See [requirements compliance](docs/compliance.md), [bug ledger](docs/audit/bugs.md), [video measurements](docs/audit/video_report.md), [evaluation evidence](docs/audit/evaluation.md) and [third-party inventory](docs/THIRD_PARTY.md).
+
+Existing checkpoints must be supplied independently. `paths.weights_url` is currently empty: the download command explains the missing release URL and does not guarantee a download. ONNX/PyTorch/serial/audit dependencies are declared in requirements.txt, but clean installation remains unverified in the audited environment. Use one OpenCV distribution; GUI display requires replacing the headless package. The tracker also needs the lap dependency supplied by its upstream tracker environment.
+
+Set `ATWFS_TEST_VIDEO` to an input video locally, then run (PowerShell):
+
+```powershell
+python -m inference.live --source "$env:ATWFS_TEST_VIDEO" --profile cpu --onnx-path outputs/checkpoints/student_v2.onnx --max-frames 300 --out-dir outputs/audit/task_a --log-features outputs/audit/task_a/features.csv
+python scripts/verify_output_video.py --run-dir outputs/audit/task_a --out-dir outputs/audit/task_a/verification
+python scripts/check_metric_claims.py
+```
+
+Remove `--max-frames` for the full clip. The verifier compares pipeline boxes to an independently run YOLOv8s at a lower confidence threshold; this is not labelled detection accuracy. Reports, masks, contact sheets, models and videos remain untracked. A clean checkout needs the underlying reports regenerated before metric-claim verification can pass.
+
+Do not connect actuators based on video or synthetic tests alone. The host has a latched software stop and final command clamps; the firmware and mandatory physical emergency stop still require hardware tests. The standalone serial demo accepts test packets only in dry-run mode. No stop-sign, traffic-light, roundabout, parking or overtaking controller is claimed.

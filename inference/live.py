@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import logging
 from pathlib import Path
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -49,6 +50,8 @@ class FrameResult:
     mask_model: Optional[np.ndarray] = None
     prob_model: Optional[np.ndarray] = None
     processing_ms: float = 0.0
+    consecutive_mask_iou: Optional[float] = None
+    horizon_fraction: Optional[float] = None
 
 
 class LivePipeline:
@@ -101,7 +104,7 @@ class LivePipeline:
         self.hood_poly_model: Optional[np.ndarray] = None
         self.prev_prob_crop: Optional[np.ndarray] = None
         self._last_road_color = [128, 128, 128]
-        self.prev_speed: Optional[float] = None
+        self.prev_speed: Optional[float] = 0.0
 
         # Low-light / night mode state
         night_cfg = cfg.get("inference", {}).get("night_mode", {})
@@ -116,7 +119,7 @@ class LivePipeline:
         self.mode_switch_count = 0
 
         # Steering history for rate limiting and EMA
-        self.prev_steer_angle: Optional[float] = None
+        self.prev_steer_angle: Optional[float] = 0.0
         self.steer_hold_counter = 0
         self.prev_waypoints: Optional[np.ndarray] = None
         self.consec_ious: List[float] = []
@@ -393,7 +396,7 @@ class LivePipeline:
             # 3. CLASSICAL & FUSION
             t_stage0 = time.perf_counter()
             geo = geometric_score(dl_mask, self.cfg["consistency"]["geometric"], apex_y=int(apex_y - pad_top))
-            tmp = temporal_score(self.prev_dl_mask, dl_mask, speed, self.cfg["consistency"]["temporal"])
+            tmp = temporal_score(self.prev_dl_mask, dl_mask, speed, {**self.cfg["consistency"]["temporal"], "dt": dt})
             self.prev_dl_mask = dl_mask.copy()
 
             alpha_val = self.fusion.alpha(unc, geo, tmp, terrain)
@@ -545,6 +548,7 @@ class LivePipeline:
             active_str = "DL"
 
         # Track consecutive-frame mask IoU
+        c_iou = None
         if self._prev_fused_mask is not None:
             inter = np.logical_and(mask > 0, self._prev_fused_mask > 0).sum()
             union = np.logical_or(mask > 0, self._prev_fused_mask > 0).sum()
@@ -571,12 +575,31 @@ class LivePipeline:
             mode=self.current_mode,
             mask_model=mask,
             prob_model=clean_prob,
+            horizon_fraction=float(self.ipm.horizon_est.smoothed_vp_y) / nh if self.ipm.horizon_est.smoothed_vp_y is not None else None,
+            consecutive_mask_iou=c_iou,
             processing_ms=(time.perf_counter() - t_stage0_frame) * 1000.0,
         )
 
 
 def is_overlap(r1: Sequence[int], r2: Sequence[int]) -> bool:
     return not (r1[0] >= r2[2] or r1[2] <= r2[0] or r1[1] >= r2[3] or r1[3] <= r2[1])
+
+
+def place_label_rect(x: int, y: int, tw: int, th: int, width: int, height: int,
+                     occupied: Sequence[Sequence[int]]) -> Optional[List[int]]:
+    """Find an in-frame, non-overlapping label rectangle or omit its text."""
+    rw, rh = tw + 4, th + 6
+    if rw > width or rh > height:
+        return None
+    xs = [max(0, min(width-rw, x)), 0, width-rw]
+    preferred_y = max(0, min(height-rh, y-th-3))
+    ys = [preferred_y, *range(0, height-rh+1, rh+2)]
+    for top in ys:
+        for left in xs:
+            rect = [left, top, left+rw, top+rh]
+            if not any(is_overlap(rect, other) for other in occupied):
+                return rect
+    return None
 
 
 def annotate(
@@ -873,24 +896,11 @@ def annotate(
         label = f"{d.name} {d.conf:.2f}"
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
 
-        lbl_x, lbl_y = d.x1, d.y1 - 5
-        rect = [lbl_x, lbl_y - th - 3, lbl_x + tw, lbl_y + 3]
-        hud_rect = [0, 0, int(380 * s), int(260 * s)]
-
-        attempts = 0
-        while (any(is_overlap(rect, pr) for pr in placed_rects) or is_overlap(rect, hud_rect)) and attempts < 10:
-            attempts += 1
-            rect[1] -= th + 5
-            rect[3] -= th + 5
-            lbl_y -= th + 5
-            if rect[1] < 0:
-                lbl_y = d.y2 + th + 5
-                rect = [lbl_x, lbl_y - th - 3, lbl_x + tw, lbl_y + 3]
-                if any(is_overlap(rect, pr) for pr in placed_rects) or is_overlap(rect, hud_rect):
-                    shift_dx = max(30, int(tw + 10))
-                    rect[0] += shift_dx
-                    rect[2] += shift_dx
-                    lbl_x += shift_dx
+        hud_rect = [0, 0, w, min(h, int(260 * s))]
+        rect = place_label_rect(d.x1, d.y1-5, tw, th, w, h, [hud_rect, *placed_rects])
+        if rect is None:
+            continue
+        lbl_x, lbl_y = rect[0]+2, rect[1]+th+3
 
         placed_rects.append(rect)
         cv2.rectangle(out, (rect[0], rect[1]), (rect[2], rect[3]), (0, 0, 0), -1)
@@ -936,6 +946,12 @@ def annotate(
     return out
 
 
+def _numpy_json(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
+    raise TypeError(f"Unsupported telemetry type: {type(value).__name__}")
+
+
 def _queue_put(q: "queue.Queue", item: Any, stop: threading.Event) -> bool:
     while not stop.is_set():
         try:
@@ -944,6 +960,42 @@ def _queue_put(q: "queue.Queue", item: Any, stop: threading.Event) -> bool:
         except queue.Full:
             continue
     return False
+
+
+class ImageSequenceCapture:
+    """Read PNG/JPEG sequences without platform video-codec backends."""
+    def __init__(self, pattern: str) -> None:
+        if len(re.findall(r"%0?\d*d", pattern)) != 1 or "%" in re.sub(r"%0?\d*d", "", pattern):
+            raise ValueError("Image sequence needs exactly one integer placeholder, for example %03d")
+        self.pattern = pattern
+        self.index = 0 if Path(pattern % 0).is_file() else 1
+        self.start = self.index
+        self.closed = False
+        self.count = 0
+        while Path(pattern % (self.start+self.count)).is_file():
+            self.count += 1
+
+    def isOpened(self) -> bool:
+        return self.count > 0 and not self.closed
+
+    def get(self, prop: int) -> float:
+        return -1.0 if prop == cv2.CAP_PROP_FPS else float(self.count) if prop == cv2.CAP_PROP_FRAME_COUNT else 0.0
+
+    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
+        if self.closed or self.index >= self.start+self.count:
+            return False, None
+        frame = cv2.imread(self.pattern % self.index, cv2.IMREAD_COLOR)
+        self.index += 1
+        return frame is not None, frame
+
+    def release(self) -> None:
+        self.closed = True
+
+
+def _open_capture(source: Union[int, str]) -> Any:
+    if isinstance(source, str) and "%" in source:
+        return ImageSequenceCapture(source)
+    return cv2.VideoCapture(source)
 
 
 class FrameGrabber(threading.Thread):
@@ -958,7 +1010,7 @@ class FrameGrabber(threading.Thread):
         errors: Optional[List[BaseException]] = None,
     ) -> None:
         super().__init__(daemon=True)
-        self.cap = cv2.VideoCapture(source)
+        self.cap = _open_capture(source)
         if not self.cap.isOpened():
             self.cap.release()
             raise ValueError("Cannot open input video or camera")
@@ -986,6 +1038,10 @@ class FrameGrabber(threading.Thread):
                     break
                 if frame is None or frame.size == 0:
                     raise ValueError("Empty or corrupt input frame")
+                if frame.ndim == 2:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                elif frame.ndim == 3 and frame.shape[2] == 4:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
                 if shape is not None and shape != frame.shape:
                     raise ValueError("Input frame size changed mid-stream")
                 shape = frame.shape
@@ -1023,6 +1079,8 @@ class InferenceWorker(threading.Thread):
         errors: List[BaseException],
         total_frames: Optional[int],
         imu_reader: Optional[IMUReader] = None,
+        fps: float = 25.0,
+        speed_mps: float = 1.0,
     ) -> None:
         super().__init__(daemon=True)
         self.p = pipeline
@@ -1033,6 +1091,8 @@ class InferenceWorker(threading.Thread):
         self.errors = errors
         self.total_frames = total_frames
         self.imu_reader = imu_reader
+        self.dt = min(1.0, 1.0 / fps) if np.isfinite(fps) and fps > 0 else 0.04
+        self.speed_mps = speed_mps
 
     def run(self) -> None:
         last_res = None
@@ -1057,7 +1117,7 @@ class InferenceWorker(threading.Thread):
                 is_skip = (idx % self.skip != 0)
                 if not is_skip or last_res is None:
                     imu_sample = self.imu_reader.get_sample(idx) if self.imu_reader else None
-                    res = self.p.process_frame(frame, frame_idx=idx, imu_sample=imu_sample)
+                    res = self.p.process_frame(frame, frame_idx=idx, imu_sample=imu_sample, dt=self.dt, speed=self.speed_mps)
                     last_res = res
                 else:
                     res = last_res
@@ -1177,12 +1237,15 @@ class WriterWorker(threading.Thread):
                     "trust": res.command.trust, "obstacle": bool(res.command.obstacle_flag),
                     "active": res.active, "mode": res.mode, "processing_ms": res.processing_ms,
                     "fps": rolling_fps, "skipped": is_skip,
+                    "consecutive_mask_iou": res.consecutive_mask_iou,
+                    "horizon_fraction": res.horizon_fraction,
+                    "hood_top": min((point[1] for point in self.cfg["inference"].get("hood_polygon") or []), default=0.9),
                     "boxes": [[d.x1,d.y1,d.x2,d.y2,d.cls_id] for d in res.detections],
                     "labels": self.annot_state.get("label_rects", []),
                     "hud": self.annot_state.get("hud_lines", []),
                     "path": self.annot_state.get("disp_pts", np.empty((0,2))).tolist(),
                 }
-                telemetry.write(json.dumps(record, allow_nan=False) + "\n")
+                telemetry.write(json.dumps(record, allow_nan=False, default=_numpy_json) + "\n")
                 if idx % 10 == 0:
                     mask_dir = self.out_dir / "masks"
                     mask_dir.mkdir(exist_ok=True)
@@ -1334,7 +1397,7 @@ def run_video(
 
     # Hood polygon handling:
     # --hood-polygon none disables the hood
-    if hood_polygon is not None:
+    if hood_polygon is not None and str(hood_polygon).strip().lower() != "auto":
         if str(hood_polygon).strip().lower() == "none":
             cfg["inference"]["hood_polygon"] = None
         else:
@@ -1342,9 +1405,15 @@ def run_video(
             if hood_p.is_file():
                 try:
                     data = json.loads(hood_p.read_text(encoding="utf-8"))
-                    cfg["inference"]["hood_polygon"] = data.get("hood_polygon", data)
+                    poly = data.get("hood_polygon") if isinstance(data, dict) else data
+                    points = np.asarray(poly, dtype=np.float64)
+                    if points.ndim != 2 or points.shape[1] != 2 or len(points) < 3 or not np.isfinite(points).all() or np.any((points < 0) | (points > 1)):
+                        raise ValueError("Hood polygon must contain at least three normalized finite [x,y] points")
+                    cfg["inference"]["hood_polygon"] = points.tolist()
                 except Exception as exc:
-                    logger.warning("Could not read hood polygon file: %s", exc)
+                    raise ValueError(f"Cannot read hood polygon: {exc}") from exc
+            else:
+                raise FileNotFoundError("Hood polygon file not found")
     elif cfg.get("inference", {}).get("hood_polygon") is None:
         from inference.hood_calibration import calibrate_or_load_hood_polygon
         try:
@@ -1355,6 +1424,8 @@ def run_video(
             logger.warning("Hood calibration failed: %s", exc)
 
     if speed_mps is not None:
+        if not np.isfinite(speed_mps) or speed_mps < 0:
+            raise ValueError("--speed-mps must be finite and nonnegative")
         cfg["inference"]["speed_mps_input"] = float(speed_mps)
 
     # Backend selection: torch, onnx, openvino
@@ -1393,6 +1464,8 @@ def run_video(
                 raise FileNotFoundError("Requested ONNX weights missing")
             if not onnx_path.is_file() and ck_path.is_file():
                 from scripts.export_onnx import export_to_onnx
+                onnx_path = out_dir_path / "exports" / onnx_path.name
+                onnx_path.parent.mkdir(parents=True, exist_ok=True)
                 onnx_path = export_to_onnx(str(ck_path), str(onnx_path), tuple(inf.get("input_size", [288, 512])), int8=use_int8)
 
             if onnx_path.is_file():
@@ -1432,7 +1505,10 @@ def run_video(
     if model is None and onnx_session is None:
         ck = Path(checkpoint) if checkpoint else resolve_path(inf["checkpoint"])
         if ck.exists():
-            model, _ = load_model_from_checkpoint(str(ck), device)
+            try:
+                model, _ = load_model_from_checkpoint(str(ck), device)
+            except Exception as exc:
+                raise ValueError(f"Cannot load PyTorch model: {exc}") from exc
         else:
             raise FileNotFoundError("Segmentation weights missing; supply --model-path or --onnx-path")
         model.eval()
@@ -1440,6 +1516,13 @@ def run_video(
             model = model.to(memory_format=torch.channels_last)
 
     live = isinstance(source, int) or str(source).lower().startswith(("rtsp://", "http://", "https://"))
+    if not live:
+        capture = _open_capture(source)
+        try:
+            if not capture.isOpened() or not capture.read()[0]:
+                raise ValueError("Cannot decode input video: empty or corrupt source")
+        finally:
+            capture.release()
     detector = detector or build_detector(
         inf["detector"],
         str(out_dir_path),
@@ -1456,7 +1539,7 @@ def run_video(
 
     grabber = FrameGrabber(source, frame_q, stop, live, max_frames, max_width, errors)
     imu_reader = IMUReader(imu_csv) if imu_csv else None
-    worker = InferenceWorker(pipeline, frame_q, result_q, stop, inf["frame_skip"], errors, grabber.total_frames, imu_reader=imu_reader)
+    worker = InferenceWorker(pipeline, frame_q, result_q, stop, inf["frame_skip"], errors, grabber.total_frames, imu_reader=imu_reader, fps=grabber.fps, speed_mps=float(inf.get("speed_mps_input", 1.0)))
     writer_worker = WriterWorker(
         result_q, packet_q, stop, pipeline, grabber.fps, Path(output_path), inf["video_fourcc"],
         grabber.total_frames, cfg, errors, out_dir=out_dir_path,
@@ -1493,6 +1576,7 @@ def run_video(
     obstacle_count = 0
     det_count = 0
     trust_list: List[float] = []
+    active_modes: List[str] = []
     fps_q: Deque[float] = collections.deque(maxlen=30)
     t_last_frame = time.perf_counter()
     sat_15_count = 0
@@ -1537,6 +1621,7 @@ def run_video(
                 zero_det_count += 1
                 zero_det_frames.append(idx)
             trust_list.append(res.command.trust)
+            active_modes.append(res.active)
 
             if abs(res.command.angle) < 1e-3:
                 steer_zero_count += 1
@@ -1685,7 +1770,7 @@ def run_video(
     sign_agree_pct = (sign_agree_count / total_pkts) * 100.0
     zero_det_pct = (zero_det_count / total_pkts) * 100.0
     mode_switches = getattr(pipeline, "mode_switch_count", 0)
-    est_switches = getattr(pipeline, "estimator_switch_count", 0)
+    est_switches = sum(a != b for a, b in zip(active_modes, active_modes[1:]))
     model_gt_150 = sum(1 for m in pipeline.stage_samples.get("model", []) if m > 150.0)
 
     print(f"Average FPS: {avg_fps:.2f} (P95 FPS: {p95_fps:.2f})")
@@ -1766,6 +1851,7 @@ def run_video(
         "steer_saturation_pct": sat_29_pct,
         "steer_ge20_pct": sat_20_pct,
         "fallback_pct": fb_pct,
+        "estimator_switches": est_switches,
         "mean_detections": mean_dets,
         "trust_stats": (t_min, t_mean, t_max),
     }
@@ -1860,7 +1946,7 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except (ValueError, OSError, RuntimeError, MemoryError) as exc:
+    except (ValueError, OSError, RuntimeError, MemoryError, ImportError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(2)
 

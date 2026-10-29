@@ -1,3 +1,9 @@
 # Video audit
 
-NOT RUN: audit in progress. No historical output is accepted as a measurement of this branch.
+The real student_v2.onnx and YOLOv8n ran on 300 and 1696 frames. CPU overall FPS was 8.53 and 8.32; model mean/p95 latency was 80.69/115.95 ms and 84.04/121.76 ms. The independent YOLOv8s reference (confidence 0.15, IoU 0.3) on the full video found precision 0.8641, recall 0.3401, 15 five-frame ghost tracks, and 122 frames without pipeline boxes where reference boxes exist. It is not ground truth. Full-video pipeline latency mean/p95 was 117.64/175.28 ms, with 198 frames over 150 ms. There were zero off-screen or overlapping labels, zero FALLBACK/trust mismatches, and zero zero-speed frames without an obstacle. Steering changed at most 5 degrees per frame; path/steering sign agreement was 0.9567 on 1316 eligible frames. Central road-strip coverage was 0.7347; mean/min consecutive mask IoU was 0.9127/0.0. Above-nominal-horizon mask fraction was 0, but this is a geometric proxy, not ground-truth accuracy. Seven failure-injection CLI cases passed. The verifier reports 40 estimator transitions while the run summary reports 12: BLOCKED pending reconciliation of counter definitions. Visual contact-sheet review, physical actuation, and GPU performance are NOT RUN. Outputs and contact sheet remain ignored under outputs/audit/.
+
+## Unresolved visual/perception findings
+
+B027: BLOCKED: YOLOv8n pipeline versus YOLOv8s reference disagreement is not sufficient to identify which detector is wrong. No model weights or confidence definitions are changed to force agreement. Human-labelled detection ground truth is required to certify the remaining misses/ghosts.
+B028: BLOCKED: planned path and rate-limited steering can have opposite signs during a reversal. Removing the safety limiter or hiding those frames would make this check misleading. Commanded-trajectory rendering requires a calibrated vehicle projection; current planned-path sign disagreement remains reported.
+
