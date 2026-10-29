@@ -1,6 +1,0 @@
-metric,value
-miou_idd,0.5041382981989834
-iou_nondrivable,0.7629194255156985
-iou_drivable,0.24535717088226833
-terrain_acc,0.375
-ece,0.18640820730060342

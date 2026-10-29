@@ -1,3 +1,0 @@
-method,mean_iou,fallback_rate,mean_alpha
-heuristic,0.7088,0.8750,0.2786
-trained_fusionnet,0.7088,0.8750,0.2812

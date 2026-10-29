@@ -20,3 +20,11 @@ outputs/test_stability/
 outputs/check_frames_v4/
 outputs/steer_debug.csv
 outputs/run_summary.txt
+
+# Generated artifacts and downloaded models
+outputs/
+check_frames/
+weights/
+*.onnx
+*.avi
+.venv-audit/
