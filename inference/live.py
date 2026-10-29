@@ -1,4 +1,5 @@
 import json
+import sys
 import os
 import argparse
 import collections
@@ -24,7 +25,7 @@ from inference.detector import Detection, ObstacleDetector, build_detector
 from inference.fusion import ATWFS
 from inference.ipm import IMUReader, InversePerspectiveMapping, IPMResult
 from inference.serial_out import SerialSender
-from models.unet_mobilenet import build_model, evidential_uncertainty
+from models.unet_mobilenet import evidential_uncertainty
 from training.train import load_model_from_checkpoint
 from utils.config import load_config, resolve_path
 from utils.logging_utils import setup_logging
@@ -47,6 +48,7 @@ class FrameResult:
     mode: str = "day"
     mask_model: Optional[np.ndarray] = None
     prob_model: Optional[np.ndarray] = None
+    processing_ms: float = 0.0
 
 
 class LivePipeline:
@@ -120,7 +122,7 @@ class LivePipeline:
         self.consec_ious: List[float] = []
         self._prev_fused_mask: Optional[np.ndarray] = None
 
-        # Estimator hysteresis state (DL ↔ FALLBACK)
+        # Estimator hysteresis state (DL â†” FALLBACK)
         inf_cfg = cfg.get("inference", {})
         self.current_estimator: str = "DL"
         self.estimator_dwell: int = 0
@@ -152,6 +154,13 @@ class LivePipeline:
         speed: float = 1.0,
         imu_sample: Optional[Dict[str, float]] = None,
     ) -> FrameResult:
+        if (not isinstance(frame_bgr, np.ndarray) or frame_bgr.ndim != 3
+                or frame_bgr.shape[2] != 3 or min(frame_bgr.shape[:2]) == 0
+                or frame_bgr.dtype != np.uint8):
+            raise ValueError("Frame must be a nonempty uint8 BGR image with 3 channels")
+        if not np.isfinite(dt) or dt <= 0 or dt > 1.0:
+            raise ValueError("Frame dt must be finite and in (0, 1] seconds")
+        t_stage0_frame = time.perf_counter()
         fh, fw = frame_bgr.shape[:2]
         mh, mw = self.input_size
         t_stage0 = time.perf_counter()
@@ -159,6 +168,9 @@ class LivePipeline:
         # 1. PREPROCESS (Fast INTER_LINEAR letterbox and cached road color)
         scale = min(mw / fw, mh / fh)
         nw, nh = int(round(fw * scale)), int(round(fh * scale))
+        if not self.cfg["data"].get("letterbox", False):
+            nw, nh = mw, mh
+        nw, nh = max(1, nw), max(1, nh)
         small = cv2.resize(frame_bgr, (nw, nh), interpolation=cv2.INTER_LINEAR)
 
         if (nw, nh) == (mw, mh):
@@ -198,7 +210,7 @@ class LivePipeline:
 
             if self.current_mode == "day":
                 # Switch only if whole frame is dark
-                if self._last_mean_luma < 35.0 and self._last_p90_luma < 65.0:
+                if self._last_mean_luma < self.night_thresh_low and self._last_p90_luma < 65.0:
                     self.night_debounce_counter += 1
                     if self.night_debounce_counter >= self.night_debounce_frames:
                         self.current_mode = "night"
@@ -208,7 +220,7 @@ class LivePipeline:
                     self.night_debounce_counter = 0
             else:
                 # Hysteresis to switch back to day
-                if self._last_mean_luma >= 45.0 or self._last_p90_luma >= 80.0:
+                if self._last_mean_luma >= self.night_thresh_high or self._last_p90_luma >= 80.0:
                     self.night_debounce_counter += 1
                     if self.night_debounce_counter >= self.night_debounce_frames:
                         self.current_mode = "day"
@@ -488,7 +500,7 @@ class LivePipeline:
         self.prev_steer_angle = cmd.angle
         self.prev_speed = cmd.speed
         self.prev_waypoints = getattr(cmd, "path_waypoints", None)
-        if cmd.saturating_term == "hold_angle":
+        if cmd.saturating_term in ("hold_angle", "decay_angle"):
             self.steer_hold_counter += 1
         else:
             self.steer_hold_counter = 0
@@ -527,7 +539,7 @@ class LivePipeline:
 
         # Display override:
         # If in FALLBACK mode via hysteresis OR trust-capped (<= 0.15), show "FALLBACK"
-        if self.current_estimator == "FALLBACK" or cmd.trust <= 0.15:
+        if cmd.trust < fallback_threshold:
             active_str = "FALLBACK"
         else:
             active_str = "DL"
@@ -559,6 +571,7 @@ class LivePipeline:
             mode=self.current_mode,
             mask_model=mask,
             prob_model=clean_prob,
+            processing_ms=(time.perf_counter() - t_stage0_frame) * 1000.0,
         )
 
 
@@ -918,7 +931,19 @@ def annotate(
         cv2.putText(out, line, (int(15 * s), y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
         y += int(30 * s)
 
+    state["label_rects"] = placed_rects
+    state["hud_lines"] = lines
     return out
+
+
+def _queue_put(q: "queue.Queue", item: Any, stop: threading.Event) -> bool:
+    while not stop.is_set():
+        try:
+            q.put(item, timeout=0.1)
+            return True
+        except queue.Full:
+            continue
+    return False
 
 
 class FrameGrabber(threading.Thread):
@@ -930,51 +955,61 @@ class FrameGrabber(threading.Thread):
         live: bool,
         max_frames: Optional[int] = None,
         max_width: Optional[int] = None,
+        errors: Optional[List[BaseException]] = None,
     ) -> None:
         super().__init__(daemon=True)
         self.cap = cv2.VideoCapture(source)
         if not self.cap.isOpened():
-            raise RuntimeError(f"Could not open {source}")
+            self.cap.release()
+            raise ValueError("Cannot open input video or camera")
         self.out_q = out_q
         self.stop = stop
         self.live = live
         self.max_frames = max_frames
-        self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 25.0
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+        if not np.isfinite(self.fps) or self.fps <= 0:
+            self.fps = 25.0
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not live else None
         self.max_width = max_width
+        self.errors = errors if errors is not None else []
 
     def run(self) -> None:
         count = 0
-        while not self.stop.is_set():
-            t_r0 = time.perf_counter()
-            ret, frame = self.cap.read()
-            if not ret:
-                break
-            if count == 0:
-                print(f"First-frame resolution: {frame.shape[1]}x{frame.shape[0]}")
-
-            if self.max_width and frame.shape[1] > self.max_width:
-                scale = self.max_width / frame.shape[1]
-                frame = cv2.resize(frame, (self.max_width, int(round(frame.shape[0] * scale))), interpolation=cv2.INTER_LINEAR)
-
-            t_read_ms = (time.perf_counter() - t_r0) * 1000.0
-
-            if self.live:
-                if self.out_q.full():
+        shape = None
+        try:
+            while not self.stop.is_set():
+                t_r0 = time.perf_counter()
+                ret, frame = self.cap.read()
+                if not ret:
+                    if count == 0 or self.live or (self.total_frames and count < self.total_frames):
+                        raise ValueError("Input ended before expected frames or camera disconnected")
+                    break
+                if frame is None or frame.size == 0:
+                    raise ValueError("Empty or corrupt input frame")
+                if shape is not None and shape != frame.shape:
+                    raise ValueError("Input frame size changed mid-stream")
+                shape = frame.shape
+                if self.max_width and frame.shape[1] > self.max_width:
+                    scale = self.max_width / frame.shape[1]
+                    frame = cv2.resize(frame, (self.max_width, max(1, int(round(frame.shape[0] * scale)))))
+                t_read_ms = (time.perf_counter() - t_r0) * 1000.0
+                if self.live and self.out_q.full():
                     try:
                         self.out_q.get_nowait()
                     except queue.Empty:
                         pass
-                self.out_q.put((count, frame, t_read_ms), timeout=1.0)
-            else:
-                self.out_q.put((count, frame, t_read_ms))
-
-            count += 1
-            if self.max_frames and count >= self.max_frames:
-                break
-
-        self.out_q.put(None)
-        self.cap.release()
+                if not _queue_put(self.out_q, (count, frame, t_read_ms), self.stop):
+                    break
+                count += 1
+                if self.max_frames and count >= self.max_frames:
+                    break
+        except BaseException as exc:
+            self.errors.append(exc)
+            logger.error("Capture failed: %s", exc)
+            self.stop.set()
+        finally:
+            self.cap.release()
+            _queue_put(self.out_q, None, self.stop)
 
 
 class InferenceWorker(threading.Thread):
@@ -1003,7 +1038,10 @@ class InferenceWorker(threading.Thread):
         last_res = None
         try:
             while not self.stop.is_set():
-                item = self.in_q.get()
+                try:
+                    item = self.in_q.get(timeout=0.1)
+                except queue.Empty:
+                    continue
                 if item is None:
                     break
 
@@ -1025,13 +1063,13 @@ class InferenceWorker(threading.Thread):
                     res = last_res
 
                 pkt_tuple = (res.command.angle, res.command.speed, res.command.trust, int(res.command.obstacle_flag))
-                self.out_q.put((idx, frame, pkt_tuple, res, is_skip))
+                _queue_put(self.out_q, (idx, frame, pkt_tuple, res, is_skip), self.stop)
         except BaseException as e:
-            logger.exception("Inference thread crashed")
+            logger.error("Inference thread failed: %s", e)
             self.errors.append(e)
             self.stop.set()
         finally:
-            self.out_q.put(None)
+            _queue_put(self.out_q, None, self.stop)
 
 
 class WriterWorker(threading.Thread):
@@ -1070,7 +1108,10 @@ class WriterWorker(threading.Thread):
         self.t_last_frame = time.perf_counter()
 
     def run(self) -> None:
+        telemetry = None
         try:
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+            telemetry = open(self.out_dir / "telemetry.jsonl", "w", encoding="utf-8")
             check_frame_indices = {
                 1: "frame_01_idx1.jpg",
                 26: "frame_02_idx26.jpg",
@@ -1092,7 +1133,10 @@ class WriterWorker(threading.Thread):
                 300: "frame_17_idx300.jpg",
             }
             while not self.stop.is_set():
-                item = self.in_q.get()
+                try:
+                    item = self.in_q.get(timeout=0.1)
+                except queue.Empty:
+                    continue
                 if item is None:
                     break
 
@@ -1128,6 +1172,21 @@ class WriterWorker(threading.Thread):
                         self.out_path, self.grabber_fps, (ann_frame.shape[1], ann_frame.shape[0]), self.fourcc
                     )
                 self.writer.write(ann_frame)
+                record = {
+                    "frame": idx, "angle": res.command.angle, "speed": res.command.speed,
+                    "trust": res.command.trust, "obstacle": bool(res.command.obstacle_flag),
+                    "active": res.active, "mode": res.mode, "processing_ms": res.processing_ms,
+                    "fps": rolling_fps, "skipped": is_skip,
+                    "boxes": [[d.x1,d.y1,d.x2,d.y2,d.cls_id] for d in res.detections],
+                    "labels": self.annot_state.get("label_rects", []),
+                    "hud": self.annot_state.get("hud_lines", []),
+                    "path": self.annot_state.get("disp_pts", np.empty((0,2))).tolist(),
+                }
+                telemetry.write(json.dumps(record, allow_nan=False) + "\n")
+                if idx % 10 == 0:
+                    mask_dir = self.out_dir / "masks"
+                    mask_dir.mkdir(exist_ok=True)
+                    cv2.imwrite(str(mask_dir / f"{idx:06d}.png"), res.mask * 255)
                 t_write_ms = (time.perf_counter() - t_w0) * 1000.0
                 self.p.timings["write"] += t_write_ms / 1000.0
                 self.p.stage_samples["write"].append(t_write_ms)
@@ -1136,15 +1195,17 @@ class WriterWorker(threading.Thread):
                 self.fps_q.append(1.0 / max(1e-4, t_now - self.t_last_frame))
                 self.t_last_frame = t_now
 
-                self.out_packet_q.put((idx, pkt, res, rolling_fps))
+                _queue_put(self.out_packet_q, (idx, pkt, res, rolling_fps), self.stop)
         except BaseException as e:
-            logger.exception("Writer thread crashed")
+            logger.error("Writer thread failed: %s", e)
             self.errors.append(e)
             self.stop.set()
         finally:
+            if telemetry is not None:
+                telemetry.close()
             if self.writer is not None:
                 self.writer.release()
-            self.out_packet_q.put(None)
+            _queue_put(self.out_packet_q, None, self.stop)
 
 
 def _open_writer(path: Path, fps: float, size_wh: Tuple[int, int], fourcc: str) -> Tuple[cv2.VideoWriter, Path]:
@@ -1195,6 +1256,16 @@ def run_video(
         out_dir_path = Path(out_dir)
     else:
         out_dir_path = Path(output_path).parent
+    if out_dir is not None:
+        root = out_dir_path.resolve()
+        for candidate in (output_path, log_features):
+            if candidate is not None and not Path(candidate).resolve().is_relative_to(root):
+                raise ValueError("All output files must be under --out-dir")
+    if isinstance(source, str) and not source.lower().startswith(("rtsp://", "http://", "https://")):
+        if not Path(source).is_file() and "%" not in source:
+            raise FileNotFoundError("Input video not found")
+    if checkpoint is not None and not Path(checkpoint).is_file():
+        raise FileNotFoundError("Requested PyTorch checkpoint missing")
     out_dir_path.mkdir(parents=True, exist_ok=True)
 
     # Safeguard check on basename
@@ -1209,7 +1280,7 @@ def run_video(
             return {"error": err_msg, "frames": 0, "packets": []}
 
     set_global_seed(cfg["seed"])
-    device = get_device()
+    device = torch.device("cpu") if profile == "cpu" else get_device()
     inf = cfg["inference"]
 
     # Set torch threads to physical cores
@@ -1277,7 +1348,7 @@ def run_video(
     elif cfg.get("inference", {}).get("hood_polygon") is None:
         from inference.hood_calibration import calibrate_or_load_hood_polygon
         try:
-            poly = calibrate_or_load_hood_polygon(source)
+            poly = calibrate_or_load_hood_polygon(source, profile_dir=out_dir_path / "camera_profiles")
             if poly is not None:
                 cfg["inference"]["hood_polygon"] = poly
         except Exception as exc:
@@ -1318,6 +1389,8 @@ def run_video(
                 if int8_p.is_file():
                     onnx_path = int8_p
 
+            if _onnx_override and not onnx_path.is_file():
+                raise FileNotFoundError("Requested ONNX weights missing")
             if not onnx_path.is_file() and ck_path.is_file():
                 from scripts.export_onnx import export_to_onnx
                 onnx_path = export_to_onnx(str(ck_path), str(onnx_path), tuple(inf.get("input_size", [288, 512])), int8=use_int8)
@@ -1338,7 +1411,7 @@ def run_video(
                     pass
                 logger.info("Loaded ONNX runtime model from %s (%d threads)", onnx_path, min(6, physical_cores))
         except Exception as exc:
-            logger.warning("ONNX runtime initialization failed (%s); continuing with PyTorch model.", exc)
+            raise ValueError(f"Cannot load ONNX model: {exc}") from exc
 
     # Device & Environment Startup Logging
     gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A (CPU)"
@@ -1356,12 +1429,12 @@ def run_video(
     print(f"  Active profile: {profile}")
     print(f"  Detector: {inf['detector'].get('weights')} @ imgsz {inf['detector'].get('imgsz')} (every {inf['detector'].get('every_n')} frames)")
 
-    if model is None:
+    if model is None and onnx_session is None:
         ck = Path(checkpoint) if checkpoint else resolve_path(inf["checkpoint"])
         if ck.exists():
             model, _ = load_model_from_checkpoint(str(ck), device)
         else:
-            model = build_model({**cfg["model"], "pretrained": False})
+            raise FileNotFoundError("Segmentation weights missing; supply --model-path or --onnx-path")
         model.eval()
         if device.type == "cpu":
             model = model.to(memory_format=torch.channels_last)
@@ -1369,7 +1442,7 @@ def run_video(
     live = isinstance(source, int) or str(source).lower().startswith(("rtsp://", "http://", "https://"))
     detector = detector or build_detector(
         inf["detector"],
-        cfg["paths"]["output_dir"],
+        str(out_dir_path),
         live_camera=live,
         device=device,
         use_tensorrt=use_tensorrt,
@@ -1381,7 +1454,7 @@ def run_video(
     result_q = queue.Queue(maxsize=inf.get("queue_size", 8))
     packet_q = queue.Queue(maxsize=inf.get("queue_size", 8))
 
-    grabber = FrameGrabber(source, frame_q, stop, live, max_frames, max_width)
+    grabber = FrameGrabber(source, frame_q, stop, live, max_frames, max_width, errors)
     imu_reader = IMUReader(imu_csv) if imu_csv else None
     worker = InferenceWorker(pipeline, frame_q, result_q, stop, inf["frame_skip"], errors, grabber.total_frames, imu_reader=imu_reader)
     writer_worker = WriterWorker(
@@ -1438,13 +1511,17 @@ def run_video(
             try:
                 item = packet_q.get(timeout=0.1)
             except queue.Empty:
-                if stop.is_set() and not writer_worker.is_alive():
+                if errors or (stop.is_set() and not writer_worker.is_alive()):
                     break
                 continue
 
             if item is None:
                 break
 
+            if errors:
+                if serial_sender is not None:
+                    serial_sender.emergency_stop("pipeline worker failed")
+                break
             idx, pkt, res, rolling_fps = item
 
             # Fix: count FALLBACK when res.active == "FALLBACK"
@@ -1627,53 +1704,12 @@ def run_video(
     print(f"Path/Steer sign agreement: {sign_agree_pct:.1f}%")
     print(f"Mode switches (day/night): {mode_switches} (Current: {pipeline.current_mode})")
 
-    # Baseline comparison (11.18 FPS baseline from newest measured run on this video)
-    baseline_300 = {
-        "avg_fps": 11.18,
-        "p95_fps": 7.52,
-        "mean_detections": 1.52,
-        "fallback_pct": 22.3,
-        "obstacle_flag_pct": 40.0,
-        "steer_saturation_pct_before": 0.0,
-        "steer_ge20_pct_before": 8.0,
-        "steer_ge15_pct_before": 12.0,
-        "trust_min": 0.049,
-        "trust_mean": 0.684,
-        "trust_max": 0.928,
-        "stages": {
-            "read": {"mean_ms": 2.28, "p95_ms": 3.10},
-            "preprocess": {"mean_ms": 8.71, "p95_ms": 11.20},
-            "model": {"mean_ms": 59.87, "p95_ms": 68.40},
-            "classical": {"mean_ms": 8.31, "p95_ms": 12.50},
-            "YOLO": {"mean_ms": 0.99, "p95_ms": 1.50},
-            "IPM": {"mean_ms": 2.52, "p95_ms": 3.80},
-            "postprocess": {"mean_ms": 3.19, "p95_ms": 4.50},
-            "annotate": {"mean_ms": 13.80, "p95_ms": 18.20},
-            "write": {"mean_ms": 6.33, "p95_ms": 9.10},
-        }
-    }
-    b_data = baseline_300
-    b_stages = b_data.get("stages", {})
-
-    report_csv = Path("outputs/reports/fps_before_after.csv")
-    report_csv.parent.mkdir(parents=True, exist_ok=True)
+    report_csv = out_dir_path / "timings.csv"
     with open(report_csv, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["metric", "before", "after", "improvement"])
-        w.writerow(["total_fps", f"{b_data.get('avg_fps', 0.0):.2f}", f"{avg_fps:.2f}", f"{avg_fps / max(0.01, b_data.get('avg_fps', 0.01)):.2f}x"])
-        for st in stage_names:
-            b_mean = b_stages.get(st, {}).get("mean_ms", 0.0)
-            a_mean = stage_stats[st]["mean_ms"]
-            ratio = f"{b_mean / max(0.01, a_mean):.2f}x faster" if a_mean > 0 else "N/A"
-            label = "stage_yolo_per_frame_ms" if st == "YOLO" else f"stage_{st}_ms"
-            w.writerow([label, f"{b_mean:.2f}", f"{a_mean:.2f}", ratio])
-        if "YOLO_active_pass" in stage_stats:
-            w.writerow(["stage_yolo_active_pass_ms", "97.00", f"{stage_stats['YOLO_active_pass']['mean_ms']:.2f}", f"{97.00 / max(0.01, stage_stats['YOLO_active_pass']['mean_ms']):.2f}x faster"])
-        w.writerow(["steer_ge15_pct", f"{b_data.get('steer_ge15_pct_before', 12.0):.1f}%", f"{sat_15_pct:.1f}%", f"{sat_15_pct - b_data.get('steer_ge15_pct_before', 12.0):+.1f}%"])
-        w.writerow(["steer_ge20_pct", f"{b_data.get('steer_ge20_pct_before', 8.0):.1f}%", f"{sat_20_pct:.1f}%", f"{sat_20_pct - b_data.get('steer_ge20_pct_before', 8.0):+.1f}%"])
-        w.writerow(["steer_saturation_pct", f"{b_data.get('steer_saturation_pct_before', 0.0):.1f}%", f"{sat_29_pct:.1f}%", f"{sat_29_pct - b_data.get('steer_saturation_pct_before', 0.0):+.1f}%"])
-        w.writerow(["mean_detections", f"{b_data.get('mean_detections', 1.52):.2f}", f"{mean_dets:.2f}", f"{mean_dets - b_data.get('mean_detections', 1.52):+.2f}"])
-        w.writerow(["fallback_pct", f"{b_data.get('fallback_pct', 22.3):.1f}%", f"{fb_pct:.1f}%", f"{fb_pct - b_data.get('fallback_pct', 22.3):+.1f}%"])
+        w.writerow(["stage", "mean_ms", "p95_ms", "total_s"])
+        for stage, stats in stage_stats.items():
+            w.writerow([stage, stats["mean_ms"], stats["p95_ms"], stats["total_s"]])
 
     # Write run_summary.txt to out_dir_path
     summary_path = out_dir_path / "run_summary.txt"
@@ -1688,18 +1724,18 @@ def run_video(
         f"Segmentation Rate:  Every {inf.get('seg_every', 1)} frame(s)",
         f"Detector Cadence:   Every {inf['detector'].get('every_n')} frames ({inf['detector'].get('weights')} @ imgsz {inf['detector'].get('imgsz')})",
         "-----------------------------------------------------------------",
-        f"Average FPS:        {avg_fps:.2f} (Baseline: {b_data.get('avg_fps', 11.18):.2f})",
-        f"P95 FPS:            {p95_fps:.2f} (Baseline: {b_data.get('p95_fps', 7.52):.2f})",
-        f"Trust (min/mean/max): {t_min:.3f} / {t_mean:.3f} / {t_max:.3f} (Baseline: {b_data.get('trust_min', 0.049):.3f} / {b_data.get('trust_mean', 0.684):.3f} / {b_data.get('trust_max', 0.928):.3f})",
-        f"FALLBACK frames:    {fb_pct:.1f}% (Baseline: {b_data.get('fallback_pct', 22.3):.1f}%)",
+        f"Average FPS:        {avg_fps:.2f}",
+        f"P95 FPS:            {p95_fps:.2f}",
+        f"Trust (min/mean/max): {t_min:.3f} / {t_mean:.3f} / {t_max:.3f}",
+        f"FALLBACK frames:    {fb_pct:.1f}%",
         f"Estimator Switches: {est_switches}",
-        f"Obstacle Flag:      {obs_pct:.1f}% (Baseline: {b_data.get('obstacle_flag_pct', 40.0):.1f}%)",
-        f"Detections / Frame: {mean_dets:.2f} (Baseline: {b_data.get('mean_detections', 1.52):.2f})",
+        f"Obstacle Flag:      {obs_pct:.1f}%",
+        f"Detections / Frame: {mean_dets:.2f}",
         f"Frames 0 Detections: {zero_det_pct:.1f}% ({zero_det_count}/{total_pkts})",
         f"Steering == 0.0 deg: {steer_zero_pct:.1f}% ({steer_zero_count}/{total_pkts})",
-        f"Steering (|angle| >= 15 deg): {sat_15_pct:.1f}% (Baseline: {b_data.get('steer_ge15_pct_before', 12.0):.1f}%)",
-        f"Steering (|angle| >= 20 deg): {sat_20_pct:.1f}% (Baseline: {b_data.get('steer_ge20_pct_before', 8.0):.1f}%)",
-        f"Steering Saturation (|angle| >= 29.5 deg): {sat_29_pct:.1f}% (Baseline: {b_data.get('steer_saturation_pct_before', 0.0):.1f}%)",
+        f"Steering (|angle| >= 15 deg): {sat_15_pct:.1f}%",
+        f"Steering (|angle| >= 20 deg): {sat_20_pct:.1f}%",
+        f"Steering Saturation (|angle| >= 29.5 deg): {sat_29_pct:.1f}%",
         f"Speed == 0.0 m/s:   {speed_zero_pct:.1f}% ({speed_zero_count}/{total_pkts})",
         f"Frames Model >150ms:{model_gt_150}",
         f"Path/Steer Sign Agreement: {sign_agree_pct:.1f}%",
@@ -1788,10 +1824,10 @@ def main() -> None:
         if backend_arg is None:
             backend_arg = "onnx"
 
-    run_video(
+    result = run_video(
         cfg=cfg,
         source=src,
-        output_path=str(resolve_path(a.output)),
+        output_path=str(Path(a.out_dir) / Path(a.output).name) if a.out_dir else str(resolve_path(a.output)),
         checkpoint=checkpoint_arg,
         max_frames=a.max_frames,
         display=a.display or None,
@@ -1817,7 +1853,14 @@ def main() -> None:
         seg_every=a.seg_every,
         out_dir=a.out_dir,
     )
+    if result.get("error"):
+        raise ValueError(result["error"])
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (ValueError, OSError, RuntimeError, MemoryError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(2)
+

@@ -41,10 +41,11 @@ def test_serial_sender_with_mock_port() -> None:
         msg1 = sender.send(3.25, 0.75, 0.91, 0)
         msg2 = sender.send_packet((-4.5, 0.0, 0.42, 1))
 
-    assert len(mock_conn.written) == 2
+    assert len(mock_conn.written) == 3
+    assert mock_conn.written[-1] == b"[+0.00, 0.000, 0.000, 1]\n"
     assert mock_conn.written[0].decode("ascii") == msg1
     assert mock_conn.written[1].decode("ascii") == msg2
-    assert mock_conn.flushed == 2
+    assert mock_conn.flushed == 3
     assert mock_conn.closed is True
 
 
@@ -70,7 +71,8 @@ def test_serial_cli_dry_run() -> None:
     )
     assert proc.returncode == 0
     lines = [line for line in proc.stdout.splitlines() if "SERIAL DRY-RUN:" in line]
-    assert len(lines) == 3
+    assert len(lines) == 4
+    assert lines[-1].endswith("[+0.00, 0.000, 0.000, 1]")
 
 
 def test_arduino_sketch_exists_and_has_safety_clamps() -> None:

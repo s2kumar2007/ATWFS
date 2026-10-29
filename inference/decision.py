@@ -177,6 +177,10 @@ def compute_command(
     ipm_valid: bool = False,
     prev_waypoints: Optional[np.ndarray] = None,
 ) -> Command:
+    if (not isinstance(mask, np.ndarray) or mask.ndim != 2 or mask.size == 0
+            or not np.isfinite(mask).all() or not math.isfinite(float(trust))
+            or not 0 <= float(trust) <= 1 or terrain not in range(4)):
+        return Command(0.0, 0.0, 0.0, True, 0.0, 0.0, 0.0)
     h, w = mask.shape
     ego_center_px = w / 2.0
 
@@ -359,6 +363,11 @@ def compute_command(
             angle_deg = min(max_steer, max(0.5, clamped_angle_deg * 0.5))
         elif delta_x < -0.5 and angle_deg > 0:
             angle_deg = max(-max_steer, min(-0.5, clamped_angle_deg * 0.5))
+
+    # Safety rate limit applies after every display/sign correction too.
+    if prev_angle is not None:
+        max_rate = float(cfg.get("max_steer_rate_deg", 5.0))
+        angle_deg = float(np.clip(angle_deg, prev_angle - max_rate, prev_angle + max_rate))
 
     # Obstacle check
     obs_flag, prox = _check_obstacles(dets, h, poly_tuple, ego_center_px, cx, y_start)

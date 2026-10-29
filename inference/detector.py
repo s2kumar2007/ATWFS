@@ -186,6 +186,7 @@ class YOLODetector(ObstacleDetector):
         # Background worker for active YOLO inference
         self._worker_queue: queue.Queue[Optional[Tuple[np.ndarray, int]]] = queue.Queue(maxsize=1)
         self._result_queue: queue.Queue[Tuple[int, List[Detection], float]] = queue.Queue()
+        self._worker_error = None
         self._worker_busy = threading.Event()
         self._stop_event = threading.Event()
         self._worker_thread = threading.Thread(target=self._yolo_worker_loop, daemon=True)
@@ -210,11 +211,15 @@ class YOLODetector(ObstacleDetector):
                 active_ms = (time.perf_counter() - t0) * 1000.0
                 self._result_queue.put((frame_idx, dets, active_ms))
             except Exception as exc:
+                self._worker_error = exc
+                self._stop_event.set()
                 logger.error("Error in YOLO active pass worker: %s", exc)
             finally:
                 self._worker_busy.clear()
 
     def _load_yolo_model(self, weights_path: str, yolo_cls: Any) -> Any:
+        if not Path(weights_path).is_file():
+            raise FileNotFoundError("YOLO weights missing; download the configured detector weights before offline inference")
         ckpt_dir = self.output_dir / "checkpoints"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         p = Path(weights_path)
@@ -366,6 +371,8 @@ class YOLODetector(ObstacleDetector):
 
     def detect(self, bgr: np.ndarray, frame_idx: int = 0) -> List[Detection]:
         """Detect obstacles without stalling the main pipeline thread."""
+        if getattr(self, "_worker_error", None) is not None:
+            raise RuntimeError(f"Detector worker failed: {self._worker_error}")
         t0 = time.perf_counter()
         h, w = bgr.shape[:2]
 
@@ -586,6 +593,7 @@ class ThreadedDetector(ObstacleDetector):
         self.every_n = max(1, every_n)
         self.lock = threading.Lock()
         self.latest: List[Detection] = []
+        self.error = None
         self.stop_event = threading.Event()
         self.frame_bgr: Optional[np.ndarray] = None
         self.frame_idx = 0
@@ -603,11 +611,21 @@ class ThreadedDetector(ObstacleDetector):
                 idx = self.frame_idx
                 self.frame_bgr = None
 
-            dets = self.backend.detect(bgr, idx)
+            try:
+                dets = self.backend.detect(bgr, idx)
+            except BaseException as exc:
+                with self.lock:
+                    self.error = exc
+                    self.latest = []
+                self.stop_event.set()
+                return
             with self.lock:
                 self.latest = dets
 
     def detect(self, bgr: np.ndarray, frame_idx: int = 0) -> List[Detection]:
+        with self.lock:
+            if self.error is not None:
+                raise RuntimeError(f"Detector thread failed: {self.error}")
         if frame_idx % self.every_n == 0:
             with self.cond:
                 self.frame_bgr = bgr
@@ -620,7 +638,8 @@ class ThreadedDetector(ObstacleDetector):
         self.stop_event.set()
         with self.cond:
             self.cond.notify()
-        self.thread.join()
+        self.thread.join(timeout=2.0)
+        self.backend.stop()
 
 
 def build_detector(

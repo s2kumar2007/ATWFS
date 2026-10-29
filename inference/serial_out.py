@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
+import threading
+import time
 from typing import Any, List, Optional, Sequence, Tuple, Union
 
 logger = logging.getLogger(__name__)
@@ -45,6 +48,12 @@ class SerialSender:
         self.timeout = float(timeout)
         self.conn = serial_conn
         self.history: List[str] = []
+        self._lock = threading.RLock()
+        self._closed = threading.Event()
+        self._estop = False
+        self._last_send = time.monotonic()
+        self._angle = 0.0
+        self._speed = 0.0
 
         if self.conn is None and not self.dry_run:
             if not self.port:
@@ -59,9 +68,33 @@ class SerialSender:
                 except Exception as exc:
                     print(f"NEEDS USER DATA: Connected Arduino serial port (use --dry-run for simulation) [{exc}]")
                     logger.warning("Serial port %s unavailable (%s); falling back to dry-run.", self.port, exc)
-                    self.dry_run = True
+                    raise OSError("Requested serial port unavailable") from exc
 
-    def send(
+        self._monitor = threading.Thread(target=self._watchdog_loop, daemon=True)
+        self._monitor.start()
+
+    def emergency_stop(self, reason: str = "requested") -> str:
+        """Latch a stop until the sender is closed and explicitly restarted."""
+        with self._lock:
+            self._estop = True
+            logger.warning("SAFETY STOP (latched): %s", reason)
+            return self.send(0.0, 0.0, 0.0, 1)
+
+    def check_watchdog(self, now: Optional[float] = None) -> None:
+        with self._lock:
+            elapsed = (time.monotonic() if now is None else now) - self._last_send
+            if elapsed > 0.300 and not self._estop:
+                self.emergency_stop("no processed command for more than 300 ms")
+
+    def _watchdog_loop(self) -> None:
+        while not self._closed.wait(0.05):
+            self.check_watchdog()
+
+    def send(self, angle: float, speed: float, trust: float, obstacle_flag: Union[int, bool]) -> str:
+        with self._lock:
+            return self._send_locked(angle, speed, trust, obstacle_flag)
+
+    def _send_locked(
         self,
         angle: float,
         speed: float,
@@ -69,6 +102,23 @@ class SerialSender:
         obstacle_flag: Union[int, bool],
     ) -> str:
         """Format and transmit a control packet."""
+        with self._lock:
+            values = (float(angle), float(speed), float(trust))
+            if not all(math.isfinite(v) for v in values):
+                self._estop = True
+            if self._estop:
+                angle, speed, trust, obstacle_flag = 0.0, 0.0, 0.0, 1
+            else:
+                angle = max(-30.0, min(30.0, values[0]))
+                angle = max(self._angle - 5.0, min(self._angle + 5.0, angle))
+                trust = max(0.0, min(1.0, values[2]))
+                speed = max(0.0, min(1.5, values[1]))
+                if obstacle_flag:
+                    speed = 0.0
+                elif trust < 0.4:
+                    speed = min(speed, 0.3)
+                self._angle, self._speed = angle, speed
+            self._last_send = time.monotonic()
         msg = format_packet(angle, speed, trust, obstacle_flag)
         self.history.append(msg)
 
@@ -82,7 +132,8 @@ class SerialSender:
                 self.conn.flush()
         except Exception as exc:
             logger.warning("Serial write failed (%s); switching to dry-run.", exc)
-            self.dry_run = True
+            self._estop = True
+            raise OSError("Serial write failed; stop latched; firmware watchdog must stop hardware") from exc
 
         return msg
 
@@ -92,6 +143,11 @@ class SerialSender:
 
     def close(self) -> None:
         """Close the underlying serial connection if open."""
+        self._closed.set()
+        try:
+            self.emergency_stop("shutdown")
+        except OSError:
+            logger.error("Shutdown stop could not reach serial port; firmware watchdog required")
         if self.conn is not None and hasattr(self.conn, "close"):
             try:
                 self.conn.close()
@@ -115,6 +171,8 @@ def main() -> None:
     ap.add_argument("--test-packets", type=int, default=5, help="Number of test packets to send")
     args = ap.parse_args()
 
+    if not args.dry_run:
+        ap.error("Test packets are allowed only with --dry-run; autonomous hardware commands come from inference.live")
     with SerialSender(port=args.serial_port, baud=args.baud, dry_run=args.dry_run) as sender:
         for i in range(args.test_packets):
             angle = (i - 2) * 2.5

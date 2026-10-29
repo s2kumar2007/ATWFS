@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -45,6 +46,7 @@ def load_config(path: Optional[str] = None, overrides: Optional[Dict[str, Any]] 
         cfg = yaml.safe_load(fh)
     if overrides:
         cfg = deep_update(cfg, overrides)
+    validate_config(cfg)
     return cfg
 
 
@@ -85,3 +87,32 @@ def smoke_config(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     }
     cfg = deep_update(cfg, small)
     return deep_update(cfg, overrides) if overrides else cfg
+
+
+def validate_config(cfg: Dict[str, Any]) -> None:
+    """Reject invalid inference contracts before loading models or opening outputs."""
+    if not isinstance(cfg, dict):
+        raise ValueError("Configuration must be a mapping")
+    try:
+        for section in ("paths", "data", "inference", "fusion", "camera"):
+            if not isinstance(cfg[section], dict):
+                raise ValueError(f"Config section {section} must be a mapping")
+        for size in (cfg["data"]["image_size"], cfg["inference"]["input_size"]):
+            if len(size) != 2 or any(not isinstance(n, int) or n <= 0 for n in size):
+                raise ValueError("Image sizes must contain two positive integers (H, W)")
+        for n in cfg["data"]["imagenet_std"]:
+            if not math.isfinite(n) or n <= 0:
+                raise ValueError("Normalization std must be finite and positive")
+        for key in ("fallback_threshold", "mask_threshold"):
+            value = cfg["fusion"][key]
+            if not math.isfinite(value) or not 0 <= value <= 1:
+                raise ValueError(f"fusion.{key} must be in [0, 1]")
+        for key in ("max_steer_deg", "v_max", "max_speed_ramp", "max_steer_rate_deg", "speed_angle_denom"):
+            value = cfg["inference"]["decision"][key]
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"decision.{key} must be finite and positive")
+        for key in ("queue_size", "frame_skip"):
+            if not isinstance(cfg["inference"][key], int) or cfg["inference"][key] <= 0:
+                raise ValueError(f"inference.{key} must be a positive integer")
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"Invalid or missing configuration key: {exc}") from exc
