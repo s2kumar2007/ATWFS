@@ -28,3 +28,5 @@ These releases exist; installation and mutual compatibility in a fresh environme
 The initial setup commit landed on local main after HEAD changed back from real during setup. The identical commit was fast-forwarded onto real, and the main reference was restored to its original baseline once verified to contain only that audit commit. No user commits were removed and no history was pushed to main. All subsequent audit commits are on real.
 
 Phase 5 gate: see outputs/audit/phase_5/results.json.
+
+Phase 6 gate: see outputs/audit/phase_6/results.json.
