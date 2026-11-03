@@ -184,3 +184,10 @@ python scripts/check_metric_claims.py
 Remove `--max-frames` for the full clip. The verifier compares pipeline boxes to an independently run YOLOv8s at a lower confidence threshold; this is not labelled detection accuracy. Reports, masks, contact sheets, models and videos remain untracked. A clean checkout needs the underlying reports regenerated before metric-claim verification can pass.
 
 Do not connect actuators based on video or synthetic tests alone. The host has a latched software stop and final command clamps; the firmware and mandatory physical emergency stop still require hardware tests. The standalone serial demo accepts test packets only in dry-run mode. No stop-sign, traffic-light, roundabout, parking or overtaking controller is claimed.
+
+---
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
