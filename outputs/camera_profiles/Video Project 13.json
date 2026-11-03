@@ -1,0 +1,30 @@
+{
+  "source": "C:\\Users\\varsh\\Downloads\\Video Project 13.mp4",
+  "resolution": [
+    1280,
+    720
+  ],
+  "frames_sampled": 150,
+  "hood_polygon": [
+    [
+      0.0,
+      0.80
+    ],
+    [
+      0.45,
+      0.78
+    ],
+    [
+      1.0,
+      0.77
+    ],
+    [
+      1.0,
+      1.0
+    ],
+    [
+      0.0,
+      1.0
+    ]
+  ]
+}

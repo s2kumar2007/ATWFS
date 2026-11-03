@@ -160,14 +160,16 @@ class ATWFS:
         f = torch.tensor([[uncertainty, geometric, temporal]], dtype=torch.float32).clamp(0, 1)
         a = float(self.net(f, torch.tensor([terrain]))[0])
         # High confidence deep learning safeguard:
-        # If evidential uncertainty is low (student model is confident), do not allow
-        # noisy classical Canny edge detection to override the deep learning mask.
-        if uncertainty < 0.25:
+        # If evidential uncertainty is low AND geometric score is sound, protect DL from noisy classical edges.
+        # If DL loses geometric plausibility (geo < 0.35), reduce alpha so classical fallback can assist.
+        if uncertainty < 0.25 and geometric >= 0.45:
             a = max(0.75, a)
+        elif geometric < 0.35:
+            a = min(0.35, a)
         return float(min(1.0, max(0.0, a)))
 
     def fuse(self, dl_mask: np.ndarray, fallback_mask: np.ndarray, uncertainty: float, geometric: float,
-             temporal: float, terrain: int) -> FusionResult:
+             temporal: float, terrain: int, alpha_override: Optional[float] = None) -> FusionResult:
         """Fuse the two masks: ``alpha * DL + (1 - alpha) * fallback``.
 
         Args:
@@ -183,7 +185,23 @@ class ATWFS:
         """
         if dl_mask.shape != fallback_mask.shape:
             raise ValueError(f"mask shapes differ: {dl_mask.shape} vs {fallback_mask.shape}")
-        a = self.alpha(uncertainty, geometric, temporal, terrain)
+        if alpha_override is not None:
+            a = float(np.clip(alpha_override, 0.0, 1.0))
+        else:
+            a = self.alpha(uncertainty, geometric, temporal, terrain)
         soft = (a * dl_mask.astype(np.float32) + (1.0 - a) * fallback_mask.astype(np.float32)).astype(np.float32)
-        return FusionResult(a, soft, (soft >= self.cfg["mask_threshold"]).astype(np.uint8),
-                            "DL" if a >= self.cfg["fallback_threshold"] else "FALLBACK")
+        dl_area = int(np.count_nonzero(dl_mask))
+        fb_area = int(np.count_nonzero(fallback_mask))
+        fb_thresh = float(self.cfg.get("fallback_threshold", 0.5))
+        mask_thresh = float(self.cfg.get("mask_threshold", 0.5))
+
+        # Seamless fallback: when DL confidence drops or DL mask collapses while classical has road,
+        # ensure fallback mask is preserved so the drivable corridor never goes blank
+        if (a < fb_thresh or dl_area < 0.03 * dl_mask.size) and fb_area > 0.04 * fallback_mask.size:
+            out_mask = fallback_mask.copy()
+            act = "FALLBACK"
+        else:
+            out_mask = (soft >= mask_thresh).astype(np.uint8)
+            act = "DL" if a >= fb_thresh else "FALLBACK"
+
+        return FusionResult(a, soft, out_mask, act)

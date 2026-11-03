@@ -71,6 +71,9 @@ class ObstacleDetector(abc.ABC):
     def close(self) -> None:
         self.stop()
 
+    def reset(self) -> None:
+        pass
+
 
 class NullDetector(ObstacleDetector):
     def detect(self, bgr: np.ndarray, frame_idx: int = 0) -> List[Detection]:
@@ -218,7 +221,14 @@ class YOLODetector(ObstacleDetector):
                 self._worker_busy.clear()
 
     def _load_yolo_model(self, weights_path: str, yolo_cls: Any) -> Any:
-        if not Path(weights_path).is_file():
+        p = Path(weights_path)
+        if not p.is_file():
+            for cand in [self.output_dir / "weights" / p.name, Path("outputs/weights") / p.name, Path(p.name)]:
+                if cand.is_file():
+                    p = cand
+                    weights_path = str(cand)
+                    break
+        if not p.is_file():
             raise FileNotFoundError("YOLO weights missing; download the configured detector weights before offline inference")
         ckpt_dir = self.output_dir / "checkpoints"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -263,7 +273,6 @@ class YOLODetector(ObstacleDetector):
 
     def _run_active_pass(self, bgr: np.ndarray, frame_idx: int) -> List[Detection]:
         h, w = bgr.shape[:2]
-        is_half = (self.device_type == "cuda")
         predict_kwargs: Dict[str, Any] = {
             "conf": self.conf,
             "iou": self.iou,
@@ -273,8 +282,6 @@ class YOLODetector(ObstacleDetector):
             "device": self.device_str,
             "verbose": False,
         }
-        if is_half:
-            predict_kwargs["half"] = True
 
         dets: List[Detection] = []
 
@@ -317,6 +324,22 @@ class YOLODetector(ObstacleDetector):
                 if (rx2 - rx1) < 5 or (ry2 - ry1) < 5:
                     continue
 
+                # Ignore false detections on ego-vehicle hood / dashboard
+                if ry2 >= int(0.82 * h) and (rx2 - rx1) >= int(0.45 * w):
+                    continue
+
+                # Ignore false detections floating in sky / tree canopies / upper building floors
+                if ry2 < int(0.32 * h):
+                    continue
+
+                # Require higher confidence for side-boundary objects to avoid false positive compound walls / gates / houses
+                if kind == 'vehicle' and (rx2 < int(0.35 * w) or rx1 > int(0.65 * w)):
+                    raw_name_lower = raw_name.lower()
+                    if any(k in raw_name_lower for k in ["truck", "bus", "train"]) and conf < 0.62:
+                        continue
+                    if conf < 0.52:
+                        continue
+
                 dets.append(
                     Detection(
                         rx1, ry1, rx2, ry2, cls_id, disp_name, float(conf), kind, 1.0, None,
@@ -326,7 +349,7 @@ class YOLODetector(ObstacleDetector):
 
         if self.device_type == "cpu":
             # Road band pass on full road region (y from 0.25 to 0.85) with rectangular inference at imgsz 480
-            y1_road, y2_road = int(0.25 * h), int(0.85 * h)
+            y1_road, y2_road = int(0.30 * h), int(0.85 * h)
             road_crop = bgr[y1_road:y2_road, :]
             crop_kwargs = dict(predict_kwargs)
             crop_kwargs["imgsz"] = 480
@@ -577,6 +600,17 @@ class YOLODetector(ObstacleDetector):
         self._last_active_dets = prop_dets
         self._last_tracker_frame = frame_idx
 
+    def reset(self) -> None:
+        self._last_tracker_frame = None
+        self._last_active_dets = []
+        self.track_histories.clear()
+        self.ema_rates.clear()
+        self.last_seen.clear()
+        self.last_real_detection_frame.clear()
+        self.consecutive_detection_count.clear()
+        self.active_pass_samples.clear()
+        self.overhead_samples.clear()
+
     def stop(self) -> None:
         self._stop_event.set()
         try:
@@ -636,6 +670,13 @@ class ThreadedDetector(ObstacleDetector):
         with self.lock:
             return list(self.latest) if frame_idx - self.latest_frame <= self.every_n + 4 else []
 
+    def reset(self) -> None:
+        with self.lock:
+            self.latest = []
+            self.latest_frame = -999
+        if hasattr(self.backend, "reset"):
+            self.backend.reset()
+
     def stop(self) -> None:
         self.stop_event.set()
         with self.cond:
@@ -656,7 +697,8 @@ def build_detector(
         return NullDetector()
 
     if "yolo" in backend_type:
-        det = YOLODetector(cfg, output_dir, device=device, use_tensorrt=use_tensorrt)
+        det_dev = torch.device(cfg["device"]) if cfg.get("device") else device
+        det = YOLODetector(cfg, output_dir, device=det_dev, use_tensorrt=use_tensorrt)
         if live_camera and cfg.get("every_n", 1) > 1:
             return ThreadedDetector(det, cfg["every_n"])
         return det

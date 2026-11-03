@@ -52,6 +52,7 @@ class FrameResult:
     processing_ms: float = 0.0
     consecutive_mask_iou: Optional[float] = None
     horizon_fraction: Optional[float] = None
+    hood_polygon: Optional[Any] = None
 
 
 class LivePipeline:
@@ -84,12 +85,32 @@ class LivePipeline:
         self.ipm = InversePerspectiveMapping(cfg["camera"])
         self.ipm_every_n = int(cfg.get("inference", {}).get("ipm_every_n", 10 if device.type == "cpu" else 5))
         self.fallback_alpha_gate = float(cfg.get("inference", {}).get("fallback_alpha_gate", 0.8))
+        self.k_iso = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
         self.mean = np.array(cfg["data"]["imagenet_mean"], dtype=np.float32).reshape(1, 1, 3)
         self.std = np.array(cfg["data"]["imagenet_std"], dtype=np.float32).reshape(1, 1, 3)
         self.inv_255_std = (1.0 / (255.0 * self.std)).astype(np.float32)
         self.sub_mean_std = (-self.mean / self.std).astype(np.float32)
         self.input_size = tuple(cfg["inference"].get("input_size", cfg["data"]["image_size"]))
+        if self.device.type == "cuda":
+            self.mean_t = torch.tensor(self.mean.reshape(3, 1, 1), device=self.device, dtype=torch.float16)
+            self.std_t = torch.tensor(self.std.reshape(3, 1, 1), device=self.device, dtype=torch.float16)
+        else:
+            self.mean_t = None
+            self.std_t = None
+
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            if self.model is not None:
+                try:
+                    dummy_x = torch.zeros((1, 3, self.input_size[0], self.input_size[1]), device=self.device, dtype=torch.float16)
+                    with torch.inference_mode():
+                        _ = self.model(dummy_x)
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
 
         self.prev_dl_mask: Optional[np.ndarray] = None
         self.mask_history: Deque[np.ndarray] = collections.deque(maxlen=3)
@@ -135,7 +156,7 @@ class LivePipeline:
         self.estimator_switch_count: int = 0
 
         # Classical estimator skip/cache parameters
-        self.classical_skip_alpha: float = float(inf_cfg.get("classical_skip_alpha", 0.8))
+        self.classical_skip_alpha: float = float(inf_cfg.get("classical_skip_alpha", 0.65))
         self.classical_cache_frames: int = int(inf_cfg.get("classical_cache_frames", 2))
 
         # Segmentation skipping cadence
@@ -148,6 +169,40 @@ class LivePipeline:
         self.last_geo: float = 0.95
         self.last_tmp: float = 1.0
         self.last_terrain: int = 0
+
+    def reset(self) -> None:
+        """Reset internal temporal states and accumulators for a clean run."""
+        self.prev_dl_mask = None
+        self.mask_history.clear()
+        self.prev_prob_crop = None
+        self._last_road_color = [128, 128, 128]
+        self.prev_speed = 0.0
+        self.night_debounce_counter = 0
+        self.current_mode = "day"
+        self._last_mean_luma = 100.0
+        self._last_p90_luma = 100.0
+        self.mode_switch_count = 0
+        self.prev_steer_angle = 0.0
+        self.steer_hold_counter = 0
+        self.prev_waypoints = None
+        self.consec_ious.clear()
+        self._prev_fused_mask = None
+        self.current_estimator = "DL"
+        self.estimator_dwell = 0
+        self.fallback_consec_count = 0
+        self.estimator_switch_count = 0
+        self.last_raw_mask = None
+        self.last_prob_smooth = None
+        self.last_fused_alpha = 1.0
+        self.last_active = "DL"
+        self.last_unc = 0.05
+        self.last_geo = 0.95
+        self.last_tmp = 1.0
+        self.last_terrain = 0
+        self.timings.clear()
+        self.stage_samples.clear()
+        if hasattr(self.detector, "reset"):
+            self.detector.reset()
 
     def process_frame(
         self,
@@ -193,14 +248,6 @@ class LivePipeline:
                 self.hood_poly_model[:, 1] = self.hood_poly_norm[:, 1] * mh
 
             apex_y = int(np.min(self.hood_poly_model[:, 1]))
-            if frame_idx % 10 == 0:
-                patch_y1, patch_y2 = max(0, int(apex_y - 20)), int(apex_y)
-                patch_x1, patch_x2 = int(mw / 2 - 20), int(mw / 2 + 20)
-                if patch_y2 > patch_y1:
-                    patch = padded[patch_y1:patch_y2, patch_x1:patch_x2]
-                    if patch.size > 0:
-                        self._last_road_color = patch.mean(axis=(0, 1)).astype(int).tolist()
-            cv2.fillPoly(padded, [self.hood_poly_model], self._last_road_color)
         else:
             apex_y = mh
 
@@ -249,8 +296,6 @@ class LivePipeline:
             hp_fw_fh[:, 1] = self.hood_poly_norm[:, 1] * fh
             valid_dets = [d for d in dets if cv2.pointPolygonTest(hp_fw_fh, (d.center_x, d.center_y), False) < 0]
             dets = valid_dets
-        if self.device.type == "cuda":
-            torch.cuda.synchronize()
         t_yolo_ms = (time.perf_counter() - t_yolo0) * 1000.0
         self.timings["yolo"] += t_yolo_ms / 1000.0
         self.stage_samples["YOLO"].append(t_yolo_ms)
@@ -324,7 +369,7 @@ class LivePipeline:
                     ent = -np.sum(probs * np.log(probs + 1e-6), axis=1) / log_k
                     unc = float(np.mean(ent))
 
-                logit_diff = seg_logits_np[0, 1] - seg_logits_np[0, 0]
+                logit_diff = np.clip(seg_logits_np[0, 1] - seg_logits_np[0, 0], -50.0, 50.0)
                 prob_road_padded = 1.0 / (1.0 + np.exp(-logit_diff))
                 dl_mask_padded = (prob_road_padded >= 0.50).astype(np.uint8)
                 terrain = 0
@@ -334,11 +379,14 @@ class LivePipeline:
                 self.stage_samples["model"].append(t_mod_ms)
             elif self.model is not None:
                 if self.device.type == "cuda":
-                    # GPU letterbox, norm and fp16
-                    t_u8 = torch.from_numpy(padded).to(self.device, non_blocking=True)
+                    # GPU letterbox, norm and fp16 in RGB format
+                    rgb_padded = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
+                    t_u8 = torch.from_numpy(rgb_padded).to(self.device, non_blocking=True)
                     x_tensor = t_u8.permute(2, 0, 1).unsqueeze(0).half() / 255.0
-                    x_tensor = (x_tensor - torch.tensor(self.mean.reshape(3, 1, 1), device=self.device).half()) / torch.tensor(self.std.reshape(3, 1, 1), device=self.device).half()
-                    torch.cuda.synchronize()
+                    if self.mean_t is not None:
+                        x_tensor = (x_tensor - self.mean_t) / self.std_t
+                    else:
+                        x_tensor = (x_tensor - torch.tensor(self.mean.reshape(3, 1, 1), device=self.device).half()) / torch.tensor(self.std.reshape(3, 1, 1), device=self.device).half()
                 else:
                     x = (cv2.cvtColor(padded, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0 - self.mean) / self.std
                     x_tensor = torch.from_numpy(x.transpose(2, 0, 1)).unsqueeze(0).to(self.device, memory_format=torch.channels_last)
@@ -350,25 +398,27 @@ class LivePipeline:
                     seg_logits = out["seg_logits"]
                     alpha_tensor = out["alpha"]
 
-                    # Compute evidential uncertainty and entropy fallback in single GPU/CPU reduction
-                    u_t = evidential_uncertainty(alpha_tensor)
-                    unc = float(u_t.mean().item())
-                    if unc < 0.01:
-                        probs = torch.softmax(seg_logits, dim=1)
-                        log_k = np.log(probs.shape[1])
-                        ent = (-(probs * torch.log(probs + 1e-6)).sum(dim=1) / log_k).mean()
-                        unc = float(ent.item())
-
-                    logit_diff = (seg_logits[0, 1] - seg_logits[0, 0]).cpu().numpy()
-                    prob_road_padded = 1.0 / (1.0 + np.exp(-logit_diff))
+                    if self.device.type == "cuda":
+                        u_mean = (2.0 / torch.clamp(alpha_tensor.sum(dim=1, keepdim=True), min=1e-6)).mean()
+                        diff = seg_logits[0, 1] - seg_logits[0, 0]
+                        prob_road_padded = torch.sigmoid(diff).float().cpu().numpy()
+                        unc = float(u_mean.cpu())
+                        if unc < 0.01:
+                            probs = torch.softmax(seg_logits, dim=1)
+                            log_k = np.log(probs.shape[1])
+                            ent = (-(probs * torch.log(probs + 1e-6)).sum(dim=1) / log_k).mean()
+                            unc = float(ent.cpu())
+                    else:
+                        u_t = evidential_uncertainty(alpha_tensor)
+                        unc = float(u_t.mean().item())
+                        logit_diff = np.clip((seg_logits[0, 1] - seg_logits[0, 0]).float().cpu().numpy(), -50.0, 50.0)
+                        prob_road_padded = 1.0 / (1.0 + np.exp(-logit_diff))
                     dl_mask_padded = (prob_road_padded >= 0.50).astype(np.uint8)
                     if self.cfg["inference"].get("use_terrain", False) and "terrain_logits" in out:
                         terrain = int(out["terrain_logits"].argmax(1)[0].item())
                     else:
                         terrain = 0
 
-                if self.device.type == "cuda":
-                    torch.cuda.synchronize()
                 t_mod_ms = (time.perf_counter() - t_stage0) * 1000.0
                 self.timings["model"] += t_mod_ms / 1000.0
                 self.stage_samples["model"].append(t_mod_ms)
@@ -378,20 +428,25 @@ class LivePipeline:
                 unc = 0.95
                 terrain = 0
 
-            # Crop letterbox padding and apply continuous temporal probability EMA
+            # Crop letterbox padding and apply responsive continuous temporal probability EMA
             prob_crop = prob_road_padded[pad_top:pad_top + nh, pad_left:pad_left + nw]
             if self.prev_prob_crop is None or self.prev_prob_crop.shape != prob_crop.shape:
                 self.prev_prob_crop = prob_crop.copy()
             else:
-                prob_crop = 0.40 * prob_crop + 0.60 * self.prev_prob_crop
+                prob_crop = 0.35 * prob_crop + 0.65 * self.prev_prob_crop
                 self.prev_prob_crop = prob_crop.copy()
 
-            # Soft spatial Gaussian filtering and vertical morphological closing
+            # Soft spatial Gaussian filtering
             prob_crop = prob_crop.astype(np.float32)
             prob_smooth = cv2.GaussianBlur(prob_crop, (5, 5), 1.0)
-            k_vert = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 21))
-            dl_mask = (prob_smooth >= 0.45).astype(np.uint8)
-            dl_mask = cv2.morphologyEx(dl_mask, cv2.MORPH_CLOSE, k_vert)
+
+            # Temporal hysteresis thresholding at model scale (eliminates boundary chattering)
+            if self.prev_dl_mask is not None and self.prev_dl_mask.shape == prob_smooth.shape:
+                dl_mask = np.where(self.prev_dl_mask > 0, (prob_smooth >= 0.32), (prob_smooth >= 0.45)).astype(np.uint8)
+            else:
+                dl_mask = (prob_smooth >= 0.40).astype(np.uint8)
+
+            dl_mask = cv2.morphologyEx(dl_mask, cv2.MORPH_CLOSE, self.k_iso)
 
             # 3. CLASSICAL & FUSION
             t_stage0 = time.perf_counter()
@@ -400,6 +455,11 @@ class LivePipeline:
             self.prev_dl_mask = dl_mask.copy()
 
             alpha_val = self.fusion.alpha(unc, geo, tmp, terrain)
+            dl_area_frac = float(np.count_nonzero(dl_mask)) / float(dl_mask.size)
+            if dl_area_frac < 0.06:
+                # DL collapsed into tiny fragments — force classical fallback to run
+                alpha_val = min(0.30, alpha_val)
+
             fb_mask_padded, _ = self.classical.estimate_with_cache(
                 padded,
                 alpha=alpha_val,
@@ -407,10 +467,11 @@ class LivePipeline:
                 cache_frames=self.classical_cache_frames,
                 horizon_y=int(0.25 * mh),
                 dets=dets_padded,
+                apex_y=int(apex_y - pad_top),
             )
             fb_mask = fb_mask_padded[pad_top:pad_top + nh, pad_left:pad_left + nw]
 
-            fused = self.fusion.fuse(dl_mask, fb_mask, unc, geo, tmp, terrain)
+            fused = self.fusion.fuse(dl_mask, fb_mask, unc, geo, tmp, terrain, alpha_override=alpha_val)
             mask = fused.mask
             active_str = fused.active
             fused_alpha = fused.alpha
@@ -427,40 +488,49 @@ class LivePipeline:
             self.last_tmp = tmp
             self.last_terrain = terrain
 
-        # 4. POST-PROCESS AT MODEL RESOLUTION
+        # 4. POST-PROCESS AT MODEL RESOLUTION (Isotropic closing & internal shadow hole filling)
         t_stage0 = time.perf_counter()
-        k_vert = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 21))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_vert)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.k_iso)
 
         if self.hood_poly_model is not None:
             hp_model_adj = self.hood_poly_model.copy()
             hp_model_adj[:, 0] -= pad_left
             hp_model_adj[:, 1] -= pad_top
-            cv2.fillPoly(mask, [hp_model_adj], 0)
-
-        # Mask reflective strip at bottom center of hood ONLY if hood is present
-        if self.hood_poly_model is not None:
-            r_y1 = int(round(0.91 * nh))
-            r_x1 = int(round(0.38 * nw))
-            r_x2 = int(round(0.65 * nw))
-            mask[r_y1:, r_x1:r_x2] = 0
-
-        # Smart component retention: keep all significant road components in the forward corridor
+            cv2.fillPoly(mask, [hp_model_adj], 0)        # Smart component retention: retain all significant road components in the forward drivable corridor
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
         if num_labels > 1:
             kept_mask = np.zeros_like(mask)
+            areas = stats[1:, cv2.CC_STAT_AREA]
+            max_area = int(np.max(areas)) if len(areas) > 0 else 0
             for i in range(1, num_labels):
                 area = stats[i, cv2.CC_STAT_AREA]
-                if area < 80:
+                if area < 60:
                     continue
                 cx, cy = centroids[i][0], centroids[i][1]
-                # Retain if significant area (>800 px) or inside the forward driving corridor
-                if area > 800 or (cy > 0.35 * nh and 0.15 * nw < cx < 0.85 * nw):
+                # Filter out sky/tree canopy artifacts high up in the frame
+                if cy < 0.25 * nh and area < 0.30 * max_area:
+                    continue
+                # Retain significant road segments or any component in the forward drivable corridor
+                if area >= 0.15 * max_area or (cy >= 0.28 * nh and 0.08 * nw <= cx <= 0.92 * nw):
                     kept_mask[labels == i] = 1
-            if np.count_nonzero(kept_mask) < 200:
-                largest_i = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+            if np.count_nonzero(kept_mask) < 100 and max_area > 0:
+                largest_i = 1 + int(np.argmax(areas))
                 kept_mask = (labels == largest_i).astype(np.uint8)
             mask = kept_mask
+
+        # Fill internal shadow / patchy asphalt holes inside the forward drivable corridor completely
+        cnts, hier = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        if hier is not None and len(cnts) > 0:
+            solid_mask = np.zeros_like(mask)
+            min_road_area = int(0.005 * nw * nh)
+            for idx, c in enumerate(cnts):
+                if hier[0][idx][3] == -1 and cv2.contourArea(c) > min_road_area:
+                    cv2.drawContours(solid_mask, [c], -1, 1, -1)
+            if np.count_nonzero(solid_mask) > 100:
+                mask = solid_mask
+
+        if self.hood_poly_model is not None:
+            cv2.fillPoly(mask, [hp_model_adj], 0)
 
         t_post_ms = (time.perf_counter() - t_stage0) * 1000.0
         self.timings["postprocess"] += t_post_ms / 1000.0
@@ -545,7 +615,7 @@ class LivePipeline:
         if cmd.trust < fallback_threshold:
             active_str = "FALLBACK"
         else:
-            active_str = "DL"
+            active_str = "DL" 
 
         # Track consecutive-frame mask IoU
         c_iou = None
@@ -559,8 +629,11 @@ class LivePipeline:
         # Upscale mask to output resolution ONCE only for final drawing
         mask_full = cv2.resize(mask, (fw, fh), interpolation=cv2.INTER_NEAREST)
 
-        # Masked probability map for high-res smooth vector rendering
-        clean_prob = prob_smooth * mask.astype(np.float32)
+        # Clean probability map for high-res smooth bilinear rendering
+        # Incorporate fused/fallback drivable region so display probability remains continuous even during fallback
+        clean_prob = np.maximum(prob_smooth, mask.astype(np.float32) * 0.85)
+        if self.hood_poly_model is not None:
+            cv2.fillPoly(clean_prob, [hp_model_adj], 0.0)
 
         return FrameResult(
             mask=mask_full,
@@ -578,6 +651,7 @@ class LivePipeline:
             horizon_fraction=float(self.ipm.horizon_est.smoothed_vp_y) / nh if self.ipm.horizon_est.smoothed_vp_y is not None else None,
             consecutive_mask_iou=c_iou,
             processing_ms=(time.perf_counter() - t_stage0_frame) * 1000.0,
+            hood_polygon=self.hood_poly_norm,
         )
 
 
@@ -639,51 +713,109 @@ def annotate(
     c_animal = get_color("animal", [128, 0, 128])
     c_tiny = get_color("tiny", [128, 128, 128])
 
-    # 1. High-resolution antialiased butter-smooth mask overlay and vector contour
-    if getattr(res, "prob_model", None) is not None and np.any(res.prob_model > 0.05):
-        p_slice = res.prob_model
+    # 1. Clean YOLOv8-Style Drivable Road Mask Overlay (Smooth continuous probability EMA + Anti-aliased Bilinear Alpha Blending)
+    if (getattr(res, "prob_model", None) is not None and np.any(res.prob_model > 0.08)) or (getattr(res, "mask_model", None) is not None and np.any(res.mask_model > 0)):
+        if getattr(res, "prob_model", None) is not None:
+            p_slice = res.prob_model.copy()
+        else:
+            p_slice = res.mask_model.astype(np.float32) * 0.85
+
+        if getattr(res, "mask_model", None) is not None and np.any(res.mask_model > 0):
+            p_slice = np.maximum(p_slice, res.mask_model.astype(np.float32) * 0.85)
         mh, mw = p_slice.shape[:2]
 
-        # Fast model-scale Continuous Temporal EMA
+        # Spatial Gaussian filter to remove high-frequency sensor noise
+        p_smooth = cv2.GaussianBlur(p_slice, (5, 5), 1.0)
+
+        # Responsive continuous temporal EMA with graceful shadow persistence (never goes blank)
         if "disp_prob" not in state or state["disp_prob"].shape != (mh, mw):
-            state["disp_prob"] = p_slice.copy()
+            disp_prob = p_smooth.copy()
         else:
-            state["disp_prob"] = 0.25 * p_slice + 0.75 * state["disp_prob"]
+            if np.max(p_smooth) < 0.30 and np.max(state["disp_prob"]) >= 0.35:
+                disp_prob = 0.85 * state["disp_prob"] + 0.15 * p_smooth
+            else:
+                disp_prob = 0.30 * p_smooth + 0.70 * state["disp_prob"]
+        state["disp_prob"] = disp_prob.copy()
 
-        smooth_field = cv2.GaussianBlur(state["disp_prob"], (5, 5), 1.2)
-        # Dual-threshold hysteresis at model scale: confident seeds (>= 0.45) & candidate road (>= 0.30)
-        seed_mask = smooth_field >= 0.45
-        cand_mask = (smooth_field >= 0.30).astype(np.uint8)
-        k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 11))
-        cand_mask = cv2.morphologyEx(cand_mask, cv2.MORPH_CLOSE, k_close)
+        # Drivable road envelope
+        env = (disp_prob >= 0.30).astype(np.uint8)
+        k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        env = cv2.morphologyEx(env, cv2.MORPH_CLOSE, k_close)
 
-        # Eliminate disconnected spurious floating blobs on buildings/trees at model scale
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(cand_mask, connectivity=8)
-        clean_mask = np.zeros_like(cand_mask)
-        min_road_area = int(0.004 * mw * mh)
-        ego_bottom_y = int(0.60 * mh)
-        for lbl in range(1, num_labels):
-            if stats[lbl, cv2.CC_STAT_AREA] < min_road_area:
-                continue
-            lbl_m = labels == lbl
-            bottom_reach = stats[lbl, cv2.CC_STAT_TOP] + stats[lbl, cv2.CC_STAT_HEIGHT]
-            if bottom_reach >= ego_bottom_y or np.any(seed_mask[lbl_m]):
-                clean_mask[lbl_m] = 1
+        # Retain primary connected road corridor from mask_model if available, else connectedComponents
+        if getattr(res, "mask_model", None) is not None and np.any(res.mask_model > 0):
+            road_mask = (res.mask_model > 0).astype(np.float32)
+        else:
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(env, connectivity=8)
+            if num_labels > 1:
+                best_lbl = 1
+                best_score = 0.0
+                areas = stats[1:, cv2.CC_STAT_AREA]
+                max_area = float(np.max(areas)) if len(areas) > 0 else 1.0
+                for i in range(1, num_labels):
+                    area = float(stats[i, cv2.CC_STAT_AREA])
+                    cx, cy = centroids[i][0], centroids[i][1]
+                    if cy < 0.22 * mh and area < 0.35 * max_area:
+                        continue
+                    score = area * (1.0 + 1.5 * (cy / float(mh)))
+                    if score > best_score:
+                        best_score = score
+                        best_lbl = i
+                road_mask = (labels == best_lbl).astype(np.float32) if best_score > 0 else env.astype(np.float32)
+            else:
+                road_mask = env.astype(np.float32)
 
-        # Upscale clean binary mask to full frame resolution
-        high_mask = cv2.resize(clean_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+        if np.count_nonzero(road_mask > 0.05) < 50 and "prev_road_mask" in state:
+            road_mask = 0.80 * state["prev_road_mask"] + 0.20 * road_mask
+        state["prev_road_mask"] = road_mask.copy()
 
-        if np.any(high_mask):
-            overlay = out.copy()
-            overlay[high_mask > 0] = c_drivable
-            cv2.addWeighted(overlay, 0.35, out, 0.65, 0, out)
+        # Cut hood polygon cleanly at model resolution if present
+        hood_poly_ref = getattr(res, "hood_polygon", None)
+        if hood_poly_ref is None:
+            hood_poly_ref = cfg.get("inference", {}).get("hood_polygon", None)
+        if hood_poly_ref is not None and not isinstance(hood_poly_ref, str) and len(hood_poly_ref) >= 3:
+            arr = np.asarray(hood_poly_ref, dtype=np.float32)
+            hp_model = np.zeros((len(arr), 2), dtype=np.int32)
+            hp_model[:, 0] = np.round(arr[:, 0] * mw).astype(np.int32)
+            hp_model[:, 1] = np.round(arr[:, 1] * mh).astype(np.int32)
+            cv2.fillPoly(road_mask, [hp_model], 0.0)
 
-            cnts, _ = cv2.findContours(high_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_KCOS)
-            for c in cnts:
-                if cv2.contourArea(c) > 1000:
-                    eps = 0.0015 * cv2.arcLength(c, True)
-                    smooth_c = cv2.approxPolyDP(c, eps, True)
-                    cv2.drawContours(out, [smooth_c], -1, (255, 255, 255), thickness, cv2.LINE_AA)
+        disp_prob_clean = disp_prob * road_mask
+
+        # Fast Sliced ROI Upscaling & Blending (< 5 ms execution)
+        nz_y, nz_x = np.nonzero(road_mask > 0.05)
+        if len(nz_y) > 0:
+            scale_x = float(w) / float(mw)
+            scale_y = float(h) / float(mh)
+            sy1, sy2 = int(nz_y.min()), int(nz_y.max()) + 1
+            sx1, sx2 = int(nz_x.min()), int(nz_x.max()) + 1
+            y1 = max(0, int(np.floor(sy1 * scale_y)))
+            y2 = min(h, int(np.ceil(sy2 * scale_y)) + 2)
+            x1 = max(0, int(np.floor(sx1 * scale_x)))
+            x2 = min(w, int(np.ceil(sx2 * scale_x)) + 2)
+
+            roi_slice = disp_prob_clean[sy1:sy2, sx1:sx2]
+            roi_prob_full = cv2.resize(roi_slice, (x2 - x1, y2 - y1), interpolation=cv2.INTER_LINEAR)
+
+            # Cut hood polygon in full ROI resolution
+            if hood_poly_ref is not None and not isinstance(hood_poly_ref, str) and len(hood_poly_ref) >= 3:
+                arr = np.asarray(hood_poly_ref, dtype=np.float32)
+                hp_roi = np.zeros((len(arr), 2), dtype=np.int32)
+                hp_roi[:, 0] = np.round(arr[:, 0] * w - x1).astype(np.int32)
+                hp_roi[:, 1] = np.round(arr[:, 1] * h - y1).astype(np.int32)
+                cv2.fillPoly(roi_prob_full, [hp_roi], 0.0)
+
+            # Smoothstep anti-aliased alpha blending (YOLOv8 style)
+            # Full opacity 0.38 in interior (prob >= 0.50), smooth cubic falloff at edges (prob in [0.30, 0.50])
+            t = np.clip((roi_prob_full - 0.30) * 5.0, 0.0, 1.0)
+            alpha_roi = (t * t * (3.0 - 2.0 * t)) * 0.38
+            beta_roi = 1.0 - alpha_roi
+
+            # Ultra-fast SIMD alpha blending on the active ROI via cv2.blendLinear
+            roi = out[y1:y2, x1:x2]
+            color_roi = np.empty_like(roi)
+            color_roi[:] = c_drivable
+            cv2.blendLinear(color_roi, roi, alpha_roi, beta_roi, roi)
     elif getattr(res, "mask_model", None) is not None:
         mh, mw = res.mask_model.shape[:2]
         nz_y, nz_x = np.nonzero(res.mask_model)
@@ -721,7 +853,9 @@ def annotate(
             cv2.drawContours(out, contours, -1, (255, 255, 255), thickness, cv2.LINE_AA)
 
     # 2. Fast hood overlay: blend only on the hood bounding box
-    hood_poly_cfg = cfg.get("inference", {}).get("hood_polygon", None)
+    hood_poly_cfg = getattr(res, "hood_polygon", None)
+    if hood_poly_cfg is None:
+        hood_poly_cfg = cfg.get("inference", {}).get("hood_polygon", None)
     if getattr(res, "mask_model", None) is not None:
         p_mask = res.mask_model
         p_h, p_w = p_mask.shape[:2]
@@ -748,12 +882,6 @@ def annotate(
 
         hp_px = state["hp_px"]
         hp_y1 = state["hp_y1"]
-        if hp_y1 < h:
-            roi_hood = out[hp_y1:, :]
-            hood_m = state["hood_mask"]
-            overlay_hood = roi_hood.copy()
-            overlay_hood[hood_m] = c_hood
-            cv2.addWeighted(overlay_hood, 0.5, roi_hood, 0.5, 0, roi_hood)
         apex_p_y = int(hp_y1 * (float(p_h) / float(h)))
     else:
         apex_p_y = p_h
@@ -1095,6 +1223,17 @@ class InferenceWorker(threading.Thread):
         self.speed_mps = speed_mps
 
     def run(self) -> None:
+        dev = getattr(self.p, "device", None)
+        mod = getattr(self.p, "model", None)
+        if dev is not None and getattr(dev, "type", None) == "cuda" and mod is not None:
+            try:
+                in_sz = getattr(self.p, "input_size", (288, 512))
+                dummy_t = torch.zeros((1, 3, in_sz[0], in_sz[1]), device=dev, dtype=torch.float16)
+                with torch.inference_mode():
+                    _ = mod(dummy_t)
+                torch.cuda.synchronize()
+            except Exception:
+                pass
         last_res = None
         try:
             while not self.stop.is_set():
@@ -1246,7 +1385,7 @@ class WriterWorker(threading.Thread):
                     "path": self.annot_state.get("disp_pts", np.empty((0,2))).tolist(),
                 }
                 telemetry.write(json.dumps(record, allow_nan=False, default=_numpy_json) + "\n")
-                if idx % 10 == 0:
+                if self.cfg.get("inference", {}).get("save_masks", False) and idx % 10 == 0:
                     mask_dir = self.out_dir / "masks"
                     mask_dir.mkdir(exist_ok=True)
                     cv2.imwrite(str(mask_dir / f"{idx:06d}.png"), res.mask * 255)
@@ -1255,7 +1394,8 @@ class WriterWorker(threading.Thread):
                 self.p.stage_samples["write"].append(t_write_ms)
 
                 t_now = time.perf_counter()
-                self.fps_q.append(1.0 / max(1e-4, t_now - self.t_last_frame))
+                if idx > 0:
+                    self.fps_q.append(1.0 / max(1e-4, t_now - self.t_last_frame))
                 self.t_last_frame = t_now
 
                 _queue_put(self.out_packet_q, (idx, pkt, res, rolling_fps), self.stop)
@@ -1373,11 +1513,13 @@ def run_video(
     if prof_cfg:
         inf["detector"]["weights"] = prof_cfg.get("detector_weights", inf["detector"].get("weights"))
         inf["detector"]["imgsz"] = prof_cfg.get("detector_imgsz", inf["detector"].get("imgsz"))
+        if "detector_device" in prof_cfg:
+            inf["detector"]["device"] = prof_cfg["detector_device"]
         inf["detector"]["every_n"] = prof_cfg.get("detector_every_n", inf["detector"].get("every_n", 3))
         inf["detector"]["crop_every_n"] = prof_cfg.get("crop_every_n", 0)
         inf["detector"]["crop_upscale"] = prof_cfg.get("crop_upscale", 1.0)
         inf["fallback_alpha_gate"] = prof_cfg.get("fallback_alpha_gate", 0.8)
-        inf["ipm_every_n"] = prof_cfg.get("ipm_every_n", 5)
+        inf["ipm_every_n"] = prof_cfg.get("ipm_every_n", 15 if fast else 5)
         inf["seg_every"] = prof_cfg.get("seg_every", 2 if profile == "cpu" else 1)
         if "input_size" in prof_cfg:
             inf["input_size"] = prof_cfg["input_size"]
@@ -1387,6 +1529,8 @@ def run_video(
 
     if fast:
         inf["detector"]["weights"] = "yolov8n.pt"
+        if "device" not in inf["detector"] or inf["detector"]["device"] is None:
+            inf["detector"]["device"] = "cpu"
 
     if camera_height_m is not None:
         cfg["camera"]["height_m"] = float(camera_height_m)
@@ -1418,6 +1562,8 @@ def run_video(
         from inference.hood_calibration import calibrate_or_load_hood_polygon
         try:
             poly = calibrate_or_load_hood_polygon(source, profile_dir=out_dir_path / "camera_profiles")
+            if poly is None:
+                poly = calibrate_or_load_hood_polygon(source, profile_dir=Path("outputs/camera_profiles"))
             if poly is not None:
                 cfg["inference"]["hood_polygon"] = poly
         except Exception as exc:
@@ -1514,6 +1660,16 @@ def run_video(
         model.eval()
         if device.type == "cpu":
             model = model.to(memory_format=torch.channels_last)
+        elif device.type == "cuda":
+            model = model.half()
+            try:
+                in_sz = tuple(inf.get("input_size", [288, 512]))
+                dummy_t = torch.zeros((1, 3, in_sz[0], in_sz[1]), device=device, dtype=torch.float16)
+                with torch.inference_mode():
+                    _ = model(dummy_t)
+                torch.cuda.synchronize()
+            except Exception:
+                pass
 
     live = isinstance(source, int) or str(source).lower().startswith(("rtsp://", "http://", "https://"))
     if not live:
@@ -1526,16 +1682,33 @@ def run_video(
     detector = detector or build_detector(
         inf["detector"],
         str(out_dir_path),
-        live_camera=live,
+        live_camera=live or inf.get("threaded_detector", True),
         device=device,
         use_tensorrt=use_tensorrt,
     )
     pipeline = LivePipeline(cfg, model, device, detector, profile_name=profile, onnx_session=onnx_session)
 
+    # Warmup pass with actual video resolution so frame 0 does not suffer CUDA kernel initialization latency
+    if not live:
+        capture = _open_capture(source)
+        try:
+            ret, f_init = capture.read()
+            if ret and f_init is not None:
+                if max_width and f_init.shape[1] > max_width:
+                    scale = max_width / f_init.shape[1]
+                    f_init = cv2.resize(f_init, (max_width, max(1, int(round(f_init.shape[0] * scale)))))
+                _ = pipeline.process_frame(f_init, 0)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                pipeline.reset()
+        finally:
+            capture.release()
+
     stop, errors = threading.Event(), []
-    frame_q = queue.Queue(maxsize=inf.get("queue_size", 8))
-    result_q = queue.Queue(maxsize=inf.get("queue_size", 8))
-    packet_q = queue.Queue(maxsize=inf.get("queue_size", 8))
+    queue_sz = max(64, int(inf.get("queue_size", 64)))
+    frame_q = queue.Queue(maxsize=queue_sz)
+    result_q = queue.Queue(maxsize=queue_sz)
+    packet_q = queue.Queue(maxsize=queue_sz)
 
     grabber = FrameGrabber(source, frame_q, stop, live, max_frames, max_width, errors)
     imu_reader = IMUReader(imu_csv) if imu_csv else None
@@ -1570,7 +1743,7 @@ def run_video(
         csv_writer = csv.writer(csv_f)
         csv_writer.writerow(["U", "G", "T", "alpha", "active", "speed", "obstacle_flag", "is_fallback"])
 
-    t_start_total = time.perf_counter()
+    t_start_total = None
     fallback_count = 0
     alpha_below_thr_count = 0
     obstacle_count = 0
@@ -1607,6 +1780,8 @@ def run_video(
                     serial_sender.emergency_stop("pipeline worker failed")
                 break
             idx, pkt, res, rolling_fps = item
+            if t_start_total is None:
+                t_start_total = time.perf_counter()
 
             # Fix: count FALLBACK when res.active == "FALLBACK"
             if res.active == "FALLBACK":
@@ -1675,8 +1850,10 @@ def run_video(
             t_now = time.perf_counter()
             fps_q.append(1.0 / max(1e-4, t_now - t_last_frame))
             t_last_frame = t_now
+        t_end_total = time.perf_counter()
     except KeyboardInterrupt:
         stop.set()
+        t_end_total = time.perf_counter()
     finally:
         stop.set()
         grabber.join(timeout=5)
@@ -1690,6 +1867,14 @@ def run_video(
             steer_debug_f.close()
         if serial_sender is not None:
             serial_sender.close()
+
+    if t_start_total is None:
+        t_start_total = time.perf_counter()
+    if 't_end_total' not in locals():
+        t_end_total = time.perf_counter()
+    total_time = t_end_total - t_start_total
+    total_pkts = max(1, len(packets))
+    avg_fps = len(packets) / total_time if total_time > 0 else 0.0
 
     if errors:
         raise RuntimeError(f"Pipeline thread crashed: {errors[0]!r}") from errors[0]
@@ -1719,9 +1904,7 @@ def run_video(
                 if temp_out.exists():
                     temp_out.unlink()
 
-    total_time = time.perf_counter() - t_start_total
-    total_pkts = max(1, len(packets))
-    avg_fps = len(packets) / total_time if total_time > 0 else 0.0
+
 
     # Build per-stage timings table
     stage_names = ["read", "preprocess", "model", "classical", "YOLO", "IPM", "postprocess", "annotate", "write"]

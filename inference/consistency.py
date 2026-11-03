@@ -72,10 +72,16 @@ def geometric_score(mask: np.ndarray, cfg: Dict[str, Any], apex_y: Optional[int]
     if y2 > y1 and y2 < h:
         patch = m[y1:y2, x1:x2]
         if patch.size > 0 and patch.mean() < 0.5:
-            ego_penalty = 0.3
+            corridor = m[y1:y2, max(0, int(0.15 * w)):min(w, int(0.85 * w))]
+            if corridor.size > 0 and corridor.mean() < 0.15:
+                ego_penalty = 0.3
+            elif w <= 100:
+                ego_penalty = 0.3
             
     score = sum(wts[k] * _clip01(v) for k, v in parts.items()) / sum(wts[k] for k in parts)
     score *= ego_penalty
+    if frac < lo:
+        score *= (frac / lo)
     return _clip01(score)
 
 

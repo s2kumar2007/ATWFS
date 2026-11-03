@@ -33,17 +33,16 @@ class ClassicalFreeSpaceEstimator:
         self._cached_mask: Optional[np.ndarray] = None
         self._cache_age: int = 0
 
-    def seed_mask(self, h: int, w: int) -> np.ndarray:
+    def seed_mask(self, h: int, w: int, apex_y: Optional[int] = None) -> np.ndarray:
         """Narrow horizontal seed strip just ABOVE the hood bottom-centre.
 
-        Samples from the centre strip of the bottom ~8% of the image (above hood),
-        which is reliably road-surface on Indian dashcam footage.
+        Samples from the forward drivable corridor immediately ahead of the vehicle bumper.
         """
-        # Use a narrow strip at [0.86*h, 0.94*h] × [0.25*w, 0.75*w]
-        top = int(0.86 * h)
-        bottom = int(0.94 * h)
-        left = int(0.25 * w)
-        right = int(0.75 * w)
+        eff_apex = apex_y if apex_y is not None else int(0.84 * h)
+        top = max(int(0.55 * h), int(eff_apex - 0.12 * h))
+        bottom = max(top + 2, int(eff_apex - 0.02 * h))
+        left = int(0.30 * w)
+        right = int(0.70 * w)
         m = np.zeros((h, w), np.uint8)
         m[top:bottom, left:right] = 1
         return m
@@ -53,6 +52,7 @@ class ClassicalFreeSpaceEstimator:
         bgr: np.ndarray,
         horizon_y: Optional[int] = None,
         dets: Optional[List[Any]] = None,
+        apex_y: Optional[int] = None,
     ) -> np.ndarray:
         """Estimate the free-space mask.
 
@@ -66,9 +66,11 @@ class ClassicalFreeSpaceEstimator:
         """
         c = self.cfg
         h, w = bgr.shape[:2]
+        if float(bgr.mean()) < 5.0:
+            return np.zeros((h, w), np.uint8)
         blur = cv2.GaussianBlur(bgr, (5, 5), 0)
         lab = cv2.cvtColor(blur, cv2.COLOR_BGR2LAB).astype(np.float32)
-        seed = self.seed_mask(h, w).astype(bool)
+        seed = self.seed_mask(h, w, apex_y=apex_y).astype(bool)
         pix = lab[seed]
         if pix.shape[0] == 0:
             return np.zeros((h, w), np.uint8)
@@ -99,6 +101,9 @@ class ClassicalFreeSpaceEstimator:
 
         k = np.ones((c.get("morph_kernel", 7),) * 2, np.uint8)
         free_u8 = cv2.morphologyEx(free.astype(np.uint8), cv2.MORPH_CLOSE, k)
+        # Bridge perspective-aligned dashed lane markings on laned roads
+        k_lane = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 9))
+        free_u8 = cv2.morphologyEx(free_u8, cv2.MORPH_CLOSE, k_lane)
         free_u8 = cv2.morphologyEx(free_u8, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         n, lbl = cv2.connectedComponents(free_u8, connectivity=8)
         if n <= 1:
@@ -151,6 +156,7 @@ class ClassicalFreeSpaceEstimator:
         cache_frames: int = 2,
         horizon_y: Optional[int] = None,
         dets: Optional[List[Any]] = None,
+        apex_y: Optional[int] = None,
     ) -> Tuple[np.ndarray, bool]:
         """Run estimate with caching.
 
@@ -160,6 +166,8 @@ class ClassicalFreeSpaceEstimator:
         - Otherwise: run full estimate, cache the result.
         """
         h, w = bgr.shape[:2]
+        if float(bgr.mean()) < 5.0:
+            return np.zeros((h, w), np.uint8), False
 
         if alpha >= skip_alpha:
             # DL trusted — return zeros (classical not needed)
@@ -173,7 +181,7 @@ class ClassicalFreeSpaceEstimator:
             return self._cached_mask, False
 
         # Run full estimate
-        mask = self.estimate(bgr, horizon_y=horizon_y, dets=dets)
+        mask = self.estimate(bgr, horizon_y=horizon_y, dets=dets, apex_y=apex_y)
         self._cached_mask = mask
         self._cache_age = 1
         return mask, True

@@ -48,15 +48,19 @@ def calibrate_hood_from_frames(
     stack = np.stack(gray_frames, axis=0).astype(np.float32)
     std_map = np.std(stack, axis=0)
 
+    # Vehicle hood is strictly confined to the lower portion of the frame
+    y_min_search = int(h * 0.80)
+
     # Automatically estimate low-variance threshold if not provided
     if std_threshold is None:
-        bottom_region = std_map[int(h * 0.75):, :]
-        p20 = float(np.percentile(bottom_region, 20))
+        bottom_region = std_map[y_min_search:, :]
+        p30 = float(np.percentile(bottom_region, 30))
         mean_b = float(np.mean(bottom_region))
         # Static hood has low std relative to road texture/motion
-        std_threshold = min(22.0, max(8.0, min(p20 + 4.0, mean_b * 0.6)))
+        std_threshold = min(18.0, max(5.0, min(p30 + 3.0, mean_b * 0.60)))
 
-    bin_mask = (std_map < std_threshold).astype(np.uint8)
+    bin_mask = np.zeros((h, w), dtype=np.uint8)
+    bin_mask[y_min_search:, :] = (std_map[y_min_search:, :] < std_threshold).astype(np.uint8)
 
     # Morphological close to join adjacent low-variance patches
     k_size = max(5, int(min(w, h) * 0.015))
@@ -102,7 +106,7 @@ def calibrate_hood_from_frames(
     # If the static low-variance region extends above y=0.85, the vehicle was stopped/slow
     # over uniform asphalt; return None to avoid cutting out the drivable road.
     min_y = np.min(nz_y)
-    if min_y < 0.85 * h:
+    if min_y < 0.78 * h:
         logger.info("Low-variance region extends up to y=%.3f; stationary road, no static hood.", min_y / h)
         return None
 
@@ -117,7 +121,7 @@ def calibrate_hood_from_frames(
     for pt in approx:
         px, py = float(pt[0][0]), float(pt[0][1])
         nx = round(float(np.clip(px / w, 0.0, 1.0)), 4)
-        ny = round(float(np.clip(py / h, 0.0, 1.0)), 4)
+        ny = round(float(np.clip(py / h, 0.80, 1.0)), 4)
         norm_pts.append([nx, ny])
 
     return norm_pts
@@ -154,12 +158,25 @@ def calibrate_or_load_hood_polygon(
     if isinstance(source_path, int) or Path(str(source_path)).exists():
         cap = cv2.VideoCapture(source_path)
         frames: List[np.ndarray] = []
+        prev_f = None
         try:
-            for _ in range(max_frames):
+            read_count = 0
+            while len(frames) < max_frames and read_count < 400:
                 ret, frame = cap.read()
                 if not ret:
                     break
-                frames.append(frame)
+                read_count += 1
+                if prev_f is not None:
+                    h_f, w_f = frame.shape[:2]
+                    diff = float(np.mean(np.abs(
+                        frame[int(h_f*0.25):int(h_f*0.65), :].astype(np.float32) -
+                        prev_f[int(h_f*0.25):int(h_f*0.65), :].astype(np.float32)
+                    )))
+                    if diff > 1.2 or len(frames) < 15:
+                        frames.append(frame)
+                else:
+                    frames.append(frame)
+                prev_f = frame
         finally:
             cap.release()
 

@@ -55,6 +55,8 @@ def subtract_obstacles(mask: np.ndarray, dets: List[Detection], dilate_px: int) 
     for d in dets:
         if d.height < 0.04 * h:
             continue
+        if d.y2 >= int(0.82 * h) and d.width >= int(0.50 * w):
+            continue
         x1 = max(0, d.x1 - dilate_px)
         x2 = min(w, d.x2 + dilate_px)
         y1 = max(0, d.y1)
@@ -216,11 +218,14 @@ def compute_command(
 
     # Check if DL mask covers < 10% of visible road (low-visibility branch)
     y_eval_start = int(0.45 * h)
-    y_eval_end = int(0.75 * h)
-    eval_area = max(1, (y_eval_end - y_eval_start) * int(0.6 * w))
-    eval_roi = mask[y_eval_start:y_eval_end, int(0.2 * w):int(0.8 * w)]
+    y_eval_end = int(0.85 * h)
+    eval_area = max(1, (y_eval_end - y_eval_start) * w)
+    road_eval = raw_mask if raw_mask is not None else mask
+    eval_roi = road_eval[y_eval_start:y_eval_end, :]
     upper_frac = float(np.count_nonzero(eval_roi)) / float(eval_area)
-    if upper_frac < 0.05:
+    total_road_px = int(np.count_nonzero(road_eval))
+    total_frac = float(total_road_px) / float(h * w)
+    if upper_frac < 0.008 or (upper_frac < 0.05 and total_frac < 0.02):
         return _low_vis_command(
             trust=min(trust, 0.15), dets=dets, cfg=cfg,
             prev_angle=prev_angle, hold_count=hold_count,
@@ -244,6 +249,10 @@ def compute_command(
     lane_width_m = float(cfg.get("max_ego_lane_width_m", 3.5))
     lane_width_px = lane_width_m / max(1e-6, px_to_m)
     lane_half_px = lane_width_px / 2.0
+
+    # Total road width for lane fraction scaling on laned multi-lane roads
+    eff_total_w_m = road_width_m if (road_width_m is not None and road_width_m >= 2.5) else img_run_width_m
+    lane_frac = min(1.0, lane_width_m / max(lane_width_m, eff_total_w_m))
 
     # 1. Extract per-row ego-lane waypoints across visible road band
     n_pts = 16
@@ -279,10 +288,15 @@ def compute_command(
             r_start, r_end = float(best_run[0]), float(best_run[-1])
             r_w = r_end - r_start
             r_center = (r_start + r_end) / 2.0
-            if r_w > 1.2 * lane_width_px:
-                # Smooth continuous transition based on road width
-                w_blend = min(1.0, max(0.0, (r_w - 1.2 * lane_width_px) / max(1.0, 0.8 * lane_width_px)))
-                ego_target = float(np.clip(curr_x, r_start + lane_half_px, r_end - lane_half_px))
+
+            # Dynamic perspective lane width at this row
+            row_lane_w_px = max(lane_width_px * 0.2, min(lane_width_px * 1.5, r_w * lane_frac))
+            row_lane_half_px = row_lane_w_px / 2.0
+
+            if r_w > 1.25 * row_lane_w_px:
+                # Multi-lane road: smooth continuous transition tracking vehicle's lane
+                w_blend = min(1.0, max(0.0, (r_w - 1.25 * row_lane_w_px) / max(1.0, 0.75 * row_lane_w_px)))
+                ego_target = float(np.clip(curr_x, r_start + row_lane_half_px, r_end - row_lane_half_px))
                 target_x = (1.0 - w_blend) * r_center + w_blend * ego_target
             else:
                 target_x = r_center

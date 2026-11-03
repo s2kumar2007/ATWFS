@@ -140,10 +140,10 @@ compression:
   cpu_threads: 0
 classical:
   seed_region:
-    top: 0.72
-    bottom: 0.98
+    top: 0.58
+    bottom: 0.80
     half_width_top: 0.12
-    half_width_bottom: 0.3
+    half_width_bottom: 0.28
   color_k: 2.5
   canny:
   - 60
@@ -183,7 +183,7 @@ fusion:
   mask_threshold: 0.5
   train_csv: ./outputs/fusion_training_data.csv
 inference:
-  checkpoint: ./outputs/checkpoints/student_best.pt
+  checkpoint: ./outputs/checkpoints/teacher_v2_best.pt
   frame_skip: 1
   queue_size: 8
   input_size:
@@ -247,10 +247,10 @@ inference:
     iou: 0.5
     agnostic_nms: true
     conf_thresholds:
-      person: 0.25
-      vehicle: 0.25
-      animal: 0.3
-    conf: 0.25
+      person: 0.35
+      vehicle: 0.40
+      animal: 0.35
+    conf: 0.35
     class_ids:
     - 0
     - 1
@@ -275,13 +275,14 @@ inference:
       - 288
       - 512
     fast:
-      detector_weights: yolov8s.pt
-      detector_imgsz: 640
+      detector_weights: yolov8n.pt
+      detector_imgsz: 480
+      detector_device: cpu
       detector_every_n: 3
       crop_every_n: 0
       crop_upscale: 1.0
       fallback_alpha_gate: 0.8
-      ipm_every_n: 5
+      ipm_every_n: 30
       input_size:
       - 288
       - 512

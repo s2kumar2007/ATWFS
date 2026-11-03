@@ -1,30 +1,45 @@
 __pycache__/
 *.pyc
-outputs/smoke/
-outputs/checkpoints/*_last.pt
-check_*.png
-outputs/checkpoints/
-outputs/weights/
-*.pt
-*.mp4
-outputs/inference/*.csv
-outputs/inference/*.mp4
-outputs/inference/run_summary.txt
-outputs/inference/check_frames_after/
-outputs/inference/check_frames_v3/
+
+# Virtual environments
+.venv/
+.venv-audit/
+
+# Large Datasets
 data/idd_converted/
 data/idd_*/
 
-.venv/
+# Temporary video outputs and debug frames
+*.avi
+check_frames/
+outputs/smoke/
 outputs/test_stability/
 outputs/check_frames_v4/
+outputs/inference/
+outputs/audit/
 outputs/steer_debug.csv
 outputs/run_summary.txt
+outputs/timings.csv
+outputs/telemetry.jsonl
+outputs/*.mp4
 
-# Generated artifacts and downloaded models
-outputs/
-check_frames/
-weights/
-*.onnx
-*.avi
-.venv-audit/
+# General output artifacts
+outputs/*
+!outputs/checkpoints/
+!outputs/weights/
+!outputs/camera_profiles/
+
+# Checkpoints to ignore (intermediate & legacy duplicates)
+outputs/checkpoints/*_last.pt
+outputs/checkpoints/*_legacy.*
+outputs/checkpoints/student_best.*
+outputs/checkpoints/student_v2.onnx
+outputs/weights/yolov8s.pt
+
+# Explicitly track canonical production models
+!outputs/checkpoints/student_v2_best.onnx
+!outputs/checkpoints/student_v2_best.pt
+!outputs/checkpoints/teacher_v2_best.pt
+!outputs/weights/yolov8n.pt
+!outputs/camera_profiles/*.json
+!data/sample_laneless.mp4
